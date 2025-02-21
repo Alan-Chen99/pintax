@@ -1,0 +1,4 @@
+[tool.pyright]
+typeCheckingMode = "standard"
+reportPrivateImportUsage = false
+reportIncompatibleMethodOverride = false
