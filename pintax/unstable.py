@@ -5,19 +5,20 @@ from ._core import (
     PintaxRuntimeError,
     PintaxTypeError,
     PintaxZeroDivisionError,
-    Quantity,
-)
-from ._core import _rules_complex as unitify_rules
-from ._core import (
+    Qt,
+    anyunit,
     dimensionless,
-    make_unit,
-    make_unit_p,
     pint_registry,
     quantity,
-    symbolic_zero,
+)
+from ._core import rules_complex as unitify_rules
+from ._primitives import (
+    convert_unit,
+    convert_unit_p,
+    make_unit,
+    make_unit_p,
     value_and_unit_p,
 )
-from ._registry import qreg
 from ._rules import unitify_jaxpr
 
 
@@ -32,19 +33,20 @@ for _x in [
     PintaxRuntimeError,
     PintaxTypeError,
     PintaxZeroDivisionError,
-    Quantity,
+    Qt,
+    convert_unit,
     make_unit,
     pint_registry,
     quantity,
-    type(qreg),
 ]:
     _x.__module__ = _dummy.__module__
 
 _ = [
+    anyunit,
+    convert_unit_p,
     dimensionless,
-    symbolic_zero,
+    make_unit_p,
     unitify_jaxpr,
     unitify_rules,
-    make_unit_p,
     value_and_unit_p,
 ]

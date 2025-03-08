@@ -1,46 +1,60 @@
 from __future__ import annotations
 
 import contextlib
-import functools
+import math
+from enum import Enum
 from functools import partial
-from typing import Callable, Literal, Sequence, final, overload
+from typing import Literal, Sequence, final
 
 import equinox as eqx
 import jax._src.pretty_printer as pp
 import numpy as np
 import pint
 from jax import Array, lax
-from jax import numpy as jnp
-from jax._src import ad_util, core, traceback_util
+from jax._src import core, traceback_util
 from jax._src.core import Primitive
-from jax._src.interpreters import ad, batching
-from jax._src.numpy.util import promote_args
-from jax._src.traceback_util import api_boundary
 from jax._src.typing import ArrayLike, DType, Shape
-from jax.interpreters import mlir
-from pint import Unit, UnitRegistry
+from pint import UnitRegistry
 from pint.errors import PintTypeError
 
 from ._utils import (
     cast_unchecked,
     check_arraylike,
-    check_unit,
-    dict_set,
     dtype_of,
-    flattenctx,
     jit,
+    pp_join,
     pp_nested,
+    pp_obj,
     pretty_print,
     ruleset,
-    with_flatten,
 )
 
 traceback_util.register_exclusion(__file__)
 
+
+@final
+class AnyUnit(Enum):
+    ANY = 1
+
+    @property
+    def dimensionality(self):
+        return self
+
+
+anyunit: Literal[AnyUnit.ANY] = AnyUnit.ANY
+
+Unit = pint.Unit | AnyUnit
+
 _global_ureg = UnitRegistry()
 dimensionless = _global_ureg.dimensionless
-_global_ureg.define("pintax_symbolic_zero=[pintax_symbolic_zero]")
-symbolic_zero: Unit = _global_ureg.pintax_symbolic_zero
+
+
+def pp_unit(u: Unit) -> pp.Doc:
+    return pp.color(
+        pp.text(repr(str(u))),
+        foreground=pp.Color.BLUE,
+        intensity=pp.Intensity.BRIGHT,
+    )
 
 
 def pint_registry() -> UnitRegistry:
@@ -83,42 +97,42 @@ class PintaxError_forward(Exception):
         self.msg = msg
 
 
-def _unitify_check_ret(x: Quantity, trace: UnitTrace) -> Quantity:
+def _unitify_check_ret(x: Qt, trace: UnitTrace) -> Qt:
     if isinstance(x._val, UnitTracer) and x._val._trace is trace:
         raise TypeError()
-    if isinstance(x._val, Quantity):
+    if isinstance(x._val, Qt):
         raise TypeError()
     return x
 
 
-def _quantity_binop(
-    fun: Callable[[Array, Array], Array], reverse=False
-) -> Callable[[QuantityLike, QuantityLike], Quantity]:
+# def _quantity_binop(
+#     fun: Callable[[Array, Array], Array], reverse=False
+# ) -> Callable[[QuantityLike, QuantityLike], Qt]:
 
-    @functools.wraps(fun)
-    @api_boundary
-    def inner(x1: QuantityLike, x2: QuantityLike, /) -> Quantity:
-        if reverse:
-            x1, x2 = x2, x1
-        for x in [x1, x2]:
-            if isinstance(x, Array):
-                raise TypeError(f"expected non-jax constant, got\n{x}")
-        # if any(isinstance(x, Array) for x in (x1, x2)):
-        #     raise TypeError()
-        #     # x1, x2 = (Quantity._create(x).as_array() for x in (x1, x2))
-        #     # x1, x2 = promote_args(str(fun), x1, x2)
-        #     # return fun(x1, x2)
-        with with_unit_trace() as trace:
-            x1, x2 = (UnitTracer(trace, trace.ensure_quantity(x)) for x in (x1, x2))
-            x1, x2 = promote_args(str(fun), x1, x2)
-            ans = fun(x1, x2)
-            return trace.ensure_quantity(ans)
+#     @functools.wraps(fun)
+#     @api_boundary
+#     def inner(x1: QuantityLike, x2: QuantityLike, /) -> Qt:
+#         if reverse:
+#             x1, x2 = x2, x1
+#         for x in [x1, x2]:
+#             if isinstance(x, Array):
+#                 raise TypeError(f"expected non-jax constant, got\n{x}")
+#         # if any(isinstance(x, Array) for x in (x1, x2)):
+#         #     raise TypeError()
+#         #     # x1, x2 = (Quantity._create(x).as_array() for x in (x1, x2))
+#         #     # x1, x2 = promote_args(str(fun), x1, x2)
+#         #     # return fun(x1, x2)
+#         with with_unit_trace() as trace:
+#             x1, x2 = (UnitTracer(trace, trace.ensure_quantity(x)) for x in (x1, x2))
+#             x1, x2 = promote_args(str(fun), x1, x2)
+#             ans = fun(x1, x2)
+#             return trace.ensure_quantity(ans)
 
-    return inner
+#     return inner
 
 
 @final
-class Quantity(eqx.Module):
+class Qt(eqx.Module):
     # _val is allowed to be a UnitTracer
     # _val is never allowed to be a Quantity
     # _unit must always be a Unit
@@ -127,7 +141,7 @@ class Quantity(eqx.Module):
 
     def __init__(self, *, _val: ArrayLike, _unit: Unit):
         assert isinstance(_unit, Unit)
-        assert not isinstance(_val, Quantity)
+        assert not isinstance(_val, Qt)
         self._val = _val
         self._unit = _unit
 
@@ -143,19 +157,28 @@ class Quantity(eqx.Module):
     def shape(self) -> Shape:
         return self.aval.shape  # type: ignore
 
-    def _to(self, new_unit: Unit) -> Quantity:
+    def _to(self, new_unit: Unit) -> Qt:
         if self._unit == new_unit:
             return self
-        if self._unit == symbolic_zero:
+        if self._unit == anyunit:
             return quantity(self._val, new_unit)
+        if new_unit == anyunit:
+            raise TypeError()
 
         return self._to_slow(new_unit)
 
     @partial(jit, static_argnames=["new_unit"], inline=True)
-    def _to_slow(self, new_unit: Unit) -> Quantity:
+    def _to_slow(self, new_unit: pint.Unit) -> Qt:
+        assert self._unit != anyunit
         dtype = dtype_of(self._val)
         assert not np.issubdtype(dtype, np.integer)
-        ans = _global_ureg.Quantity(self._val, self._unit).to(new_unit)
+        try:
+            ans = _global_ureg.Quantity(self._val, self._unit).to(new_unit)
+        except pint.DimensionalityError as e:
+            raise PintaxError_forward(
+                ex_type=PintaxTypeError,
+                msg=str(e),
+            ) from None
         assert ans.units == new_unit
         assert isinstance(ans.magnitude, Array)
         if ans.magnitude.dtype == dtype:
@@ -165,94 +188,54 @@ class Quantity(eqx.Module):
         return quantity(out_mag, new_unit)
 
     @staticmethod
-    def _create(v: QuantityLike) -> Quantity:
-        if isinstance(v, Quantity):
+    def _create(v: _QuantityLike) -> Qt:
+        if isinstance(v, Qt):
             return v
-        if isinstance(v, pint.Quantity):
-            unit = v.units
-            assert isinstance(unit, Unit)
-            check_arraylike(v.magnitude)
-            return quantity(v.magnitude, unit)
-        if isinstance(v, Unit):
-            return quantity(1.0, v)
+        # if isinstance(v, pint.Quantity):
+        #     unit = v.units
+        #     assert isinstance(unit, Unit)
+        #     check_arraylike(v.magnitude)
+        #     return quantity(v.magnitude, unit)
+        # if isinstance(v, Unit):
+        #     return quantity(1.0, v)
 
-        if isinstance(v, int | float) and v == 0.0:
-            return quantity(v, symbolic_zero)
+        if isinstance(v, int | float) and (v == 0.0 or math.isinf(v) or math.isnan(v)):
+            return quantity(v, anyunit)
 
-        if isinstance(v, np.ndarray) and v.shape == () and v == 0.0:
-            return quantity(v, symbolic_zero)
+        if (
+            isinstance(v, np.ndarray)
+            and v.shape == ()
+            and (v == 0.0 or np.isinf(v) or np.isnan(v))
+        ):
+            return quantity(v, anyunit)
 
         check_arraylike(v)
         return quantity(v, dimensionless)
 
-    def _pretty_print(self, prefix: pp.Doc = pp.text("Quantity")) -> pp.Doc:
-        # modified from equinox._pretty_print
+    def _pretty_print(self, prefix: pp.Doc = pp.text("_Quantity_internal")) -> pp.Doc:
         val = pretty_print(self._val)
-        unit = pp.color(
-            pp.text(repr(str(self._unit))),
-            foreground=pp.Color.BLUE,
-            intensity=pp.Intensity.BRIGHT,
+        return pp_obj(
+            prefix,
+            pretty_print(self._val),
+            pp_unit(self._unit),
         )
-
-        _comma_sep = pp.concat([pp.text(","), pp.brk()])
-        nested = pp.concat(
-            [
-                pp.nest(2, pp.concat([pp.brk(""), pp.join(_comma_sep, [val, unit])])),
-                pp.brk(""),
-            ]
-        )
-        return pp.group(pp.concat([prefix, pp.text("("), nested, pp.text(")")]))
 
     def __repr__(self):
         return self._pretty_print().format()
 
-    @api_boundary
-    def as_array(self) -> Array:
-        ans = self._val * make_unit(self._unit)
-        assert isinstance(ans, Array)
-        return ans
-
-    __jax_array__ = as_array
-
-    # lax does not jit and gives better unit errors
-    __add__ = _quantity_binop(lax.add)
-    __radd__ = _quantity_binop(lax.add, reverse=True)
-
-    __sub__ = _quantity_binop(lax.sub)
-    __rsub__ = _quantity_binop(lax.sub, reverse=True)
-
-    __mul__ = _quantity_binop(lax.mul)
-    __rmul__ = _quantity_binop(lax.mul, reverse=True)
-
-    __truediv__ = _quantity_binop(lax.div)
-    __rtruediv__ = _quantity_binop(lax.div, reverse=True)
-
-    def __neg__(self) -> Quantity:
-        return quantity(-cast_unchecked[Array]()(self._val), self._unit)
-
-    def __pow__(self, p: int | float) -> Quantity:
-        assert isinstance(p, int | float)
-        return quantity(self._val**p, check_unit(self._unit**p))
-
-    def __float__(self):
-        return float(cast_unchecked()(self._to(dimensionless)._val))
-
-    def __array__(self):
-        return np.array(cast_unchecked()(self._to(dimensionless)._val))
-
 
 def quantity(val: ArrayLike, unit: Unit):
-    return Quantity(_val=val, _unit=unit)
+    return Qt(_val=val, _unit=unit)
 
 
-QuantityLike = ArrayLike | Quantity | pint.Quantity | Unit
+_QuantityLike = ArrayLike | Qt
 
 
 class UnitTracer(core.Tracer):
-    _q: Quantity
+    _q: Qt
 
-    def __init__(self, trace: core.Trace, val: Quantity):
-        assert isinstance(val, Quantity)
+    def __init__(self, trace: core.Trace, val: Qt):
+        assert isinstance(val, Qt)
         if isinstance(val._val, UnitTracer):
             assert val._val._trace is not trace
         self._trace = trace
@@ -275,7 +258,12 @@ class UnitTracer(core.Tracer):
         return self._q._pretty_print(pp.text("UnitTracer")).format()
 
     def __array__(self):
-        return self._q.__array__()
+        ans = self._q._to(dimensionless)._val
+        return np.array(ans)
+
+    def __float__(self):
+        ans = self._q._to(dimensionless)._val
+        return float(cast_unchecked()(ans))
 
 
 class UnitTrace(core.Trace[UnitTracer]):
@@ -287,25 +275,21 @@ class UnitTrace(core.Trace[UnitTracer]):
         print("invalidate:", self, id(self))
         super().invalidate()
 
-    def ensure_quantity(self, x: QuantityLike) -> Quantity:
+    def ensure_quantity(self, x: _QuantityLike) -> Qt:
         if isinstance(x, UnitTracer) and x._trace is self:
             return x._q
 
-        # this is allowed; for ex with
-        # unitify(lambda: qreg.meter + qreg.meter)()
-        if (
-            isinstance(x, Quantity)
-            and isinstance(x._val, UnitTracer)
-            and x._val._trace is self
-        ):
-            from ._rules import mul_units
+        if isinstance(x, Qt) and isinstance(x._val, UnitTracer):
+            assert x._val._trace is not self
 
-            inner_q = x._val._q
-            # TODO: is this always true?
-            assert inner_q._unit in [dimensionless, symbolic_zero]
-            return quantity(inner_q._val, mul_units(inner_q._unit, x._unit))
+            # from ._rules import mul_units
 
-        return Quantity._create(x)
+            # inner_q = x._val._q
+            # # TODO: is this always true?
+            # assert inner_q._unit in [dimensionless, anyunit]
+            # return quantity(inner_q._val, mul_units(inner_q._unit, x._unit))
+
+        return Qt._create(x)
 
     def _process_primitive(
         self, primitive: Primitive, tracers: Sequence[ArrayLike], params
@@ -323,10 +307,10 @@ class UnitTrace(core.Trace[UnitTracer]):
             # if all(x._unit == dimensionless for x in args):
             #     return primitive.bind(*(x._val for x in args), **params)
 
-            if primitive in _rules_complex:
-                out_quants = _rules_complex[primitive](self, *args, **params)
-            elif primitive in _rules:
-                out_units = _rules[primitive](self, *(x._unit for x in args), **params)
+            if primitive in rules_complex:
+                out_quants = rules_complex[primitive](self, *args, **params)
+            elif primitive in rules:
+                out_units = rules[primitive](self, *(x._unit for x in args), **params)
 
                 out_val = primitive.bind(*(x._val for x in args), **params)
                 if not primitive.multiple_results:
@@ -376,8 +360,17 @@ class UnitTrace(core.Trace[UnitTracer]):
             else:
                 # extra_msg = pp.text(f"{type(ex)}")
                 try:
-                    extra_msg = pp.join(
-                        pp.brk(), [pp.text(f"({type(ex).__name__})"), pp.text(str(ex))]
+                    extra_msg = pp_join(
+                        pp_join(
+                            "(",
+                            pp.color(
+                                pp.text(type(ex).__name__),
+                                foreground=pp.Color.RED,
+                            ),
+                            ")",
+                            sep="",
+                        ),
+                        *(str(ex).splitlines()),
                     )
                 except Exception as fmt_ex:
                     extra_msg = pp.text(
@@ -408,47 +401,12 @@ class UnitTrace(core.Trace[UnitTracer]):
                 )
 
             desc = pp.join(pp.brk(), parts)
-            raise ex_type(desc.format()) from ex
+            desc_fmt = desc.format()
+            raise ex_type(desc_fmt) from ex
 
 
-_rules = ruleset[Unit]()
-_rules_complex = ruleset[Quantity]()
-
-
-@overload
-def unitify[**P](
-    fun: Callable[P, Array],
-    *,
-    unwrap_outs: Literal[True] = True,
-    force_dimensionless_outs: Literal[False] = False,
-) -> Callable[P, Array | Quantity]: ...
-
-
-@overload
-def unitify[**P](
-    fun: Callable[P, Array],
-    *,
-    unwrap_outs: Literal[False],
-    force_dimensionless_outs: Literal[False] = False,
-) -> Callable[P, Quantity]: ...
-
-
-@overload
-def unitify[**P](
-    fun: Callable[P, Array],
-    *,
-    unwrap_outs: Literal[True] = True,
-    force_dimensionless_outs: Literal[True],
-) -> Callable[P, Array]: ...
-
-
-@overload
-def unitify[**P, R](
-    fun: Callable[P, R],
-    *,
-    unwrap_outs=True,
-    force_dimensionless_outs=False,
-) -> Callable[P, R]: ...
+rules = ruleset[Unit]()
+rules_complex = ruleset[Qt]()
 
 
 @contextlib.contextmanager
@@ -460,131 +418,86 @@ def with_unit_trace():
             yield trace
 
 
-def unitify(
-    fun: Callable, *, unwrap_outs=True, force_dimensionless_outs=False
-) -> Callable:
-    """
-    first 3 overloads extend to pytrees
-    last overload infer a generic type that might not be correct
-    """
-    if force_dimensionless_outs and not unwrap_outs:
-        raise TypeError()
+# @overload
+# def unitify[**P](
+#     fun: Callable[P, Array],
+#     *,
+#     unwrap_outs: Literal[True] = True,
+#     force_dimensionless_outs: Literal[False] = False,
+# ) -> Callable[P, Array | Qt]: ...
 
-    def _unitify_flat(
-        ctx: flattenctx, bufs: Sequence[QuantityLike]
-    ) -> Sequence[Quantity | ArrayLike]:
-        with with_unit_trace() as trace:
-            bufs_q = [UnitTracer(trace, trace.ensure_quantity(x)) for x in bufs]
-            out_bufs = ctx.call(bufs_q)
-            out_bufs_q = [trace.ensure_quantity(x) for x in out_bufs]
-            if unwrap_outs:
-                ans = [x._val if x._unit == dimensionless else x for x in out_bufs_q]
-            elif force_dimensionless_outs:
-                for x in out_bufs_q:
-                    assert x._unit == dimensionless
-                ans = [x._val for x in out_bufs_q]
-            else:
-                ans = out_bufs_q
 
-            # for x in ans:
-            #     if isinstance(x, Quantity):
-            #         if isinstance(x._val, UnitTracer) and x._val.trace is trace:
-            #             raise TypeError()
-            #         if isinstance(x._val, Quantity):
-            #             raise TypeError()
+# @overload
+# def unitify[**P](
+#     fun: Callable[P, Array],
+#     *,
+#     unwrap_outs: Literal[False],
+#     force_dimensionless_outs: Literal[False] = False,
+# ) -> Callable[P, Qt]: ...
 
-            return ans
 
-    return with_flatten(
-        fun,
-        _unitify_flat,
-        lambda arg: isinstance(arg, QuantityLike),
-    )
+# @overload
+# def unitify[**P](
+#     fun: Callable[P, Array],
+#     *,
+#     unwrap_outs: Literal[True] = True,
+#     force_dimensionless_outs: Literal[True],
+# ) -> Callable[P, Array]: ...
+
+
+# @overload
+# def unitify[**P, R](
+#     fun: Callable[P, R],
+#     *,
+#     unwrap_outs=True,
+#     force_dimensionless_outs=False,
+# ) -> Callable[P, R]: ...
+
+
+# def unitify(
+#     fun: Callable, *, unwrap_outs=True, force_dimensionless_outs=False
+# ) -> Callable:
+
+#     assert False
+#     # """
+#     # first 3 overloads extend to pytrees
+#     # last overload infer a generic type that might not be correct
+#     # """
+#     # if force_dimensionless_outs and not unwrap_outs:
+#     #     raise TypeError()
+
+#     # def _unitify_flat(
+#     #     ctx: flattenctx, bufs: Sequence[QuantityLike]
+#     # ) -> Sequence[Qt | ArrayLike]:
+#     #     with with_unit_trace() as trace:
+#     #         bufs_q = [UnitTracer(trace, trace.ensure_quantity(x)) for x in bufs]
+#     #         out_bufs = ctx.call(bufs_q)
+#     #         out_bufs_q = [trace.ensure_quantity(x) for x in out_bufs]
+#     #         if unwrap_outs:
+#     #             ans = [x._val if x._unit == dimensionless else x for x in out_bufs_q]
+#     #         elif force_dimensionless_outs:
+#     #             for x in out_bufs_q:
+#     #                 assert x._unit == dimensionless
+#     #             ans = [x._val for x in out_bufs_q]
+#     #         else:
+#     #             ans = out_bufs_q
+
+#     #         # for x in ans:
+#     #         #     if isinstance(x, Quantity):
+#     #         #         if isinstance(x._val, UnitTracer) and x._val.trace is trace:
+#     #         #             raise TypeError()
+#     #         #         if isinstance(x._val, Quantity):
+#     #         #             raise TypeError()
+
+#     #         return ans
+
+#     # return with_flatten(
+#     #     fun,
+#     #     _unitify_flat,
+#     #     lambda arg: isinstance(arg, QuantityLike),
+#     # )
 
 
 def _debug_pjit_direct(*args, jaxpr: core.ClosedJaxpr, **_):
     assert len(jaxpr.consts) == 0
     return core.eval_jaxpr(jaxpr.jaxpr, jaxpr.consts, *args)
-
-
-@api_boundary
-def make_unit(unit: Unit) -> Array:
-    assert isinstance(unit, Unit)
-    ans = make_unit_p.bind(unit=unit)
-    assert isinstance(ans, Array)
-    return ans
-
-
-@api_boundary
-def value_and_unit(value: ArrayLike) -> tuple[Array, Array]:
-    val, unit = value_and_unit_p.bind(value)
-    assert isinstance(val, Array)
-    assert isinstance(unit, Array)
-    return val, unit
-
-
-# make_unit_p
-make_unit_p = core.Primitive("make_unit")
-
-
-@make_unit_p.def_abstract_eval
-def _(*, unit: Unit):
-    assert isinstance(unit, Unit)
-    return core.get_aval(1.0)
-
-
-@_rules_complex(make_unit_p)
-def _(*, unit: Unit):
-    return quantity(1.0, unit)
-
-
-@make_unit_p.def_impl
-def _(*, unit: Unit):
-    raise TypeError(f"trying to use {unit!r} outside of unitify")
-
-
-@partial(mlir.register_lowering, make_unit_p)
-@cast_unchecked[mlir.LoweringRule]()
-def _(ctx, *, unit: Unit):
-    raise TypeError(f"trying to use {unit!r} outside of unitify")
-
-
-# value_and_unit_p
-value_and_unit_p = core.Primitive("value_and_unit")
-value_and_unit_p.multiple_results = True
-
-
-@value_and_unit_p.def_abstract_eval
-def _(arg: core.ShapedArray):
-    return arg, core.ShapedArray(shape=(), dtype=jnp.int32)
-
-
-@_rules_complex(value_and_unit_p)
-def _(x: Quantity):
-    return quantity(x._val, dimensionless), quantity(1.0, x._unit)
-
-
-@dict_set(ad.primitive_jvps, value_and_unit_p)
-def _(primals: tuple[ArrayLike], tangents: tuple[ArrayLike]):
-    val, unit = value_and_unit_p.bind(*primals)
-    (t,) = tangents
-    return (val, unit), (
-        t / unit,
-        ad_util.Zero(core.ShapedArray(shape=(), dtype=jnp.int32)),
-    )
-
-
-@dict_set(batching.primitive_batchers, value_and_unit_p)
-def _(batched_args: tuple[ArrayLike], batch_dims: tuple[int]):
-    (bd,) = batch_dims
-    return value_and_unit_p.bind(*batched_args), (bd, batching.not_mapped)
-
-
-@value_and_unit_p.def_impl
-def _(*_, **__):
-    raise TypeError(f"trying to use {value_and_unit} outside of unitify")
-
-
-@partial(mlir.register_lowering, value_and_unit_p)
-def _(*_, **__):
-    raise TypeError(f"trying to use {value_and_unit} outside of unitify")

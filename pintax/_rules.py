@@ -4,29 +4,31 @@ import functools
 from typing import Callable, Sequence
 
 import jax
-import jax._src.pretty_printer as pp
 import numpy as np
 from jax import Array, lax
 from jax._src import ad_util, core, pjit, traceback_util
+from jax._src.checkify import check_p
 from jax._src.core import Primitive
 from jax._src.debugging import debug_callback_p
 from jax._src.typing import ArrayLike
-from pint import Unit
+
+from pintax._primitives import make_unit
 
 from ._core import (
     PintaxError_forward,
     PintaxNotImplementedError,
     PintaxTypeError,
-    PintaxZeroDivisionError,
-    Quantity,
-    _rules,
-    _rules_complex,
+    Qt,
+    Unit,
+    UnitTracer,
+    anyunit,
     dimensionless,
     quantity,
-    symbolic_zero,
-    unitify,
+    rules,
+    rules_complex,
+    with_unit_trace,
 )
-from ._utils import cast_unchecked, check_unit
+from ._utils import cast_unchecked, check_unit, pp_join
 from ._utils import safe_zip as zip
 from ._utils import weakref_lru_cache_
 
@@ -40,13 +42,18 @@ def unitify_jaxpr(
     force_out_units: tuple[Unit | None, ...] | None = None,
 ) -> tuple[core.Jaxpr, tuple[Unit, ...]]:
 
-    def inner(*args: Array):
-        return core.eval_jaxpr(jaxpr, [], *args)
+    def inner(*args: Qt):
+        with with_unit_trace() as trace:
+            args_arr = [UnitTracer(trace, x) for x in args]
+            out_bufs: list[ArrayLike] = core.eval_jaxpr(jaxpr, [], *args_arr)
+            ans = [trace.ensure_quantity(x) for x in out_bufs]
+            if force_out_units is not None:
+                ans = [
+                    x if u is None else x._to(u) for x, u in zip(ans, force_out_units)
+                ]
+            return ans
 
-    out_jaxpr, out_shapes = jax.make_jaxpr(
-        unitify(inner, unwrap_outs=False),
-        return_shape=True,
-    )(
+    out_jaxpr, out_shapes = jax.make_jaxpr(inner, return_shape=True)(
         *[
             quantity(cast_unchecked[Array]()(x.aval), u)
             for u, x in zip(in_units, jaxpr.invars)
@@ -55,7 +62,7 @@ def unitify_jaxpr(
     assert len(out_jaxpr.consts) == 0
 
     def inner2(x):
-        assert isinstance(x, Quantity)
+        assert isinstance(x, Qt)
         return x._unit
 
     return out_jaxpr.jaxpr, tuple(inner2(x) for x in out_shapes)
@@ -80,8 +87,6 @@ _unary_linear = [
 # ordered as they are in jax/_src/lax/lax.py
 _nounit_ops = [
     #
-    lax.iota_p,
-    #
     lax.exp_p,
     lax.exp2_p,
     lax.log_p,
@@ -102,8 +107,17 @@ _nounit_ops = [
     lax.asinh_p,
     lax.acosh_p,
     lax.atanh_p,
-    #
+    ##
     lax.pow_p,  # maybe special case
+    lax.iota_p,
+    lax.floor_p,  # TODO?
+    ##
+    lax.and_p,
+    lax.reduce_and_p,
+    lax.not_p,
+    lax.or_p,
+    ##
+    check_p,
 ]
 
 
@@ -131,9 +145,9 @@ _sametype_nounit_ret = [
 ]
 
 
-@_rules(lax.convert_element_type_p)
+@rules(lax.convert_element_type_p)
 def _(x: Unit, new_dtype: np.dtype, **_):
-    if x in [dimensionless, symbolic_zero]:
+    if x in [dimensionless, anyunit]:
         return x
     assert isinstance(new_dtype, np.dtype)
     if np.issubdtype(new_dtype, np.integer):
@@ -144,7 +158,7 @@ def _(x: Unit, new_dtype: np.dtype, **_):
     return x
 
 
-@_rules.many(_unary_linear)
+@rules.many(_unary_linear)
 def _(prim: Primitive):
     def func(one_arg: Unit, **kwargs):
         return one_arg
@@ -152,11 +166,14 @@ def _(prim: Primitive):
     return func
 
 
-@_rules_complex.many(_nounit_ops)
+@rules_complex.many(_nounit_ops)
 def _(prim: Primitive):
-    def func(*args: Quantity, **kwargs) -> Quantity | list[Quantity]:
+    def func(*args: Qt, **kwargs) -> Qt | list[Qt]:
         for x in args:
-            if x._unit.dimensionality != dimensionless.dimensionality:
+            if (
+                x._unit != anyunit
+                and x._unit.dimensionality != dimensionless.dimensionality
+            ):
                 raise PintaxError_forward(
                     ex_type=PintaxTypeError,
                     msg=f"expected dimensionless, got {x._unit}",
@@ -171,12 +188,22 @@ def _(prim: Primitive):
 
 
 def mul_units(x: Unit, y: Unit):
-    if x == symbolic_zero or y == symbolic_zero:
-        return symbolic_zero
+    if x == anyunit:
+        x = dimensionless
+    if y == anyunit:
+        y = dimensionless
     return check_unit(x * y)
 
 
-@_rules.many(_mul_ops)
+def div_units(x: Unit, y: Unit):
+    if x == anyunit:
+        x = dimensionless
+    if y == anyunit:
+        y = dimensionless
+    return check_unit(x / y)
+
+
+@rules.many(_mul_ops)
 def _(prim: Primitive):
     def func(x: Unit, y: Unit, **kwargs):
         return mul_units(x, y)
@@ -184,18 +211,12 @@ def _(prim: Primitive):
     return func
 
 
-@_rules(lax.div_p)
+@rules(lax.div_p)
 def _(x: Unit, y: Unit):
-    if x == symbolic_zero:
-        return symbolic_zero
-    if y == symbolic_zero:
-        raise PintaxError_forward(ex_type=PintaxZeroDivisionError)
-    return check_unit(x / y)
+    return div_units(x, y)
 
 
-def sync_dims(
-    prim: Primitive, args: tuple[Quantity, ...]
-) -> tuple[Unit, tuple[Quantity, ...]]:
+def sync_dims(prim: Primitive, args: tuple[Qt, ...]) -> tuple[Unit, tuple[Qt, ...]]:
     dtype = args[0].dtype
     for x in args:
         if x.dtype != dtype:
@@ -203,32 +224,32 @@ def sync_dims(
                 ex_type=PintaxTypeError,
                 msg=f"dtype mismatch: {dtype} and {x.dtype}",
             )
-    nonzero = [x._unit for x in args if x._unit != symbolic_zero]
-    unit = nonzero[0] if len(nonzero) > 0 else symbolic_zero
-    dm = unit.dimensionality
-    for x in nonzero:
-        if x.dimensionality != dm:
-            msg = "\n".join(f"{x}" for x in args)
-            raise PintaxError_forward(
-                ex_type=PintaxTypeError,
-                msg=pp.join(
-                    pp.brk(),
-                    [
-                        pp.text("dimensionality mismatch:"),
-                        pp.text(str(dm)),
-                        pp.text("and"),
-                        pp.text(str(x.dimensionality)),
-                    ],
-                ),
-            )
+    nonzero = [x._unit for x in args if x._unit != anyunit]
+    if len(nonzero) == 0:
+        unit = anyunit
+    else:
+        unit = nonzero[0]
+        dm = unit.dimensionality
+        for x in nonzero:
+            if x.dimensionality != dm:
+                msg = "\n".join(f"{x}" for x in args)
+                raise PintaxError_forward(
+                    ex_type=PintaxTypeError,
+                    msg=pp_join(
+                        "dimensionality mismatch:",
+                        str(dm),
+                        "and",
+                        str(x.dimensionality),
+                    ),
+                )
     return unit, tuple(x._to(unit) for x in args)
 
 
-@_rules_complex.many(_sametype_ops)
+@rules_complex.many(_sametype_ops)
 def _(prim: Primitive):
     assert not prim.multiple_results
 
-    def func(*args: Quantity, **kwargs):
+    def func(*args: Qt, **kwargs):
         u, args_ = sync_dims(prim, args)
         ans = prim.bind(*(x._val for x in args_), **kwargs)
         return quantity(ans, u)
@@ -236,11 +257,11 @@ def _(prim: Primitive):
     return func
 
 
-@_rules_complex.many(_sametype_nounit_ret)
+@rules_complex.many(_sametype_nounit_ret)
 def _(prim: Primitive):
     assert not prim.multiple_results
 
-    def func(*args: Quantity, **kwargs):
+    def func(*args: Qt, **kwargs):
         _, args_ = sync_dims(prim, args)
         ans = prim.bind(*(x._val for x in args_), **kwargs)
         return quantity(ans, dimensionless)
@@ -248,9 +269,9 @@ def _(prim: Primitive):
     return func
 
 
-@_rules_complex(pjit.pjit_p)
+@rules_complex(pjit.pjit_p)
 def _(
-    *args: Quantity,
+    *args: Qt,
     jaxpr: core.ClosedJaxpr,
     **kwargs,
 ):
@@ -273,27 +294,27 @@ def _(
     return tuple(quantity(x, u) for x, u in zip(out_vals, out_units))
 
 
-@_rules(lax.integer_pow_p)
+@rules(lax.integer_pow_p)
 def _(x: Unit, y: int):
-    if x == symbolic_zero:
+    if x == anyunit:
         assert y > 0
-        return symbolic_zero
+        return anyunit
     return check_unit(x**y)
 
 
-@_rules(lax.sqrt_p)
+@rules(lax.sqrt_p)
 def _(x: Unit):
-    if x == symbolic_zero:
-        return symbolic_zero
+    if x == anyunit:
+        return anyunit
     return check_unit(x**0.5)
 
 
-@_rules(lax.split_p)
+@rules(lax.split_p)
 def _(x: Unit, sizes: Sequence[int], **_):
     return tuple(x for _ in sizes)
 
 
-@_rules(lax.linalg.eig_p)
+@rules(lax.linalg.eig_p)
 def _(
     x: Unit,
     compute_left_eigenvectors: bool,
@@ -308,35 +329,40 @@ def _(
     return tuple(output)
 
 
-@_rules(lax.linalg.eigh_p)
+@rules(lax.linalg.eigh_p)
 def _(x: Unit, **_):
     return (dimensionless, x)
 
 
-@_rules(lax.argmax_p)
+@rules(lax.argmin_p)
 def _(x: Unit, **_):
     return dimensionless
 
 
-@_rules(lax.reduce_min_p)
+@rules(lax.argmax_p)
+def _(x: Unit, **_):
+    return dimensionless
+
+
+@rules(lax.reduce_min_p)
 def _(x: Unit, **_):
     return x
 
 
-@_rules(lax.dynamic_slice_p)
+@rules(lax.dynamic_slice_p)
 def _(operand: Unit, *starts_and_dyn_sizes: Unit, **_):
     for x in starts_and_dyn_sizes:
         assert x == dimensionless
     return operand
 
 
-@_rules(lax.gather_p)
+@rules(lax.gather_p)
 def _(operand: Unit, indices: Unit, **_):
     assert indices == dimensionless
     return operand
 
 
-@_rules(lax.linalg.svd_p)
+@rules(lax.linalg.svd_p)
 def _(operand: Unit, compute_uv: bool, **_):
     if compute_uv:
         return (operand, dimensionless, dimensionless)
@@ -344,8 +370,8 @@ def _(operand: Unit, compute_uv: bool, **_):
         return (operand,)
 
 
-@_rules_complex(lax.scatter_add_p)
-def _(operand: Quantity, scatter_indices: Quantity, updates: Quantity, **kwargs):
+@rules_complex(lax.scatter_add_p)
+def _(operand: Qt, scatter_indices: Qt, updates: Qt, **kwargs):
     assert scatter_indices._unit == dimensionless
     u, (operand, updates) = sync_dims(lax.scatter_add_p, (operand, updates))
     ans = lax.scatter_add_p.bind(
@@ -354,9 +380,9 @@ def _(operand: Quantity, scatter_indices: Quantity, updates: Quantity, **kwargs)
     return quantity(ans, u)
 
 
-@_rules_complex(lax.select_n_p)
-def _(which: Quantity, *cases: Quantity):
-    assert which._unit == dimensionless
+@rules_complex(lax.select_n_p)
+def _(which: Qt, *cases: Qt):
+    assert which._unit in [dimensionless, anyunit]
     u, cases = sync_dims(lax.select_n_p, cases)
     ans = lax.select_n_p.bind(which._val, *(c._val for c in cases))
     return quantity(ans, u)
@@ -366,21 +392,32 @@ def _(which: Quantity, *cases: Quantity):
 def make_debug_callback(callback: Callable, units: Sequence[Unit]):
     @functools.wraps(callback)
     def inner(*args: ArrayLike):
-        return callback(*[quantity(x, u) for x, u in zip(args, units)])
+        with with_unit_trace() as trace:
+            return callback(
+                *[
+                    x if u == dimensionless else make_unit(x, u)
+                    for x, u in zip(args, units)
+                ]
+            )
 
     return inner
 
 
-@_rules_complex(debug_callback_p)
-def _(*args: Quantity, callback: Callable, **kwargs):
+@rules_complex(debug_callback_p)
+def _(*args: Qt, callback: Callable, **kwargs):
     new_callback = make_debug_callback(callback, tuple(x._unit for x in args))
     () = debug_callback_p.bind(*[x._val for x in args], callback=new_callback, **kwargs)
     return ()
 
 
-@_rules_complex(lax.scan_p)
+@rules(debug_callback_p)
+def _(*args: Unit, **_):
+    return ()
+
+
+@rules_complex(lax.scan_p)
 def _(
-    *args: Quantity,
+    *args: Qt,
     jaxpr: core.ClosedJaxpr,
     num_carry: int,
     num_consts: int,
@@ -392,16 +429,44 @@ def _(
 
     num_ys = len(jaxpr.out_avals) - num_carry
 
-    carry_units = [x._unit for x in args[num_consts : num_consts + num_carry]]
+    consts = args[:num_consts]
+    carry = args[num_consts : num_consts + num_carry]
+    xs = args[num_consts + num_carry :]
+
+    consts_units = tuple(x._unit for x in consts)
+    init_carry_units = tuple(x._unit for x in carry)
+    xs_units = tuple(x._unit for x in xs)
+
+    def get_carry_units() -> tuple[Unit, ...]:
+        carry_units = init_carry_units
+        for _ in range(1000):
+            _, out_units = unitify_jaxpr(
+                jaxpr.jaxpr,
+                consts_units + carry_units + xs_units,
+            )
+            new_units = out_units[:num_carry]
+            if not any(
+                x == anyunit and y != anyunit for x, y in zip(carry_units, new_units)
+            ):
+                return new_units
+            carry_units = new_units
+
+        raise RuntimeError("infinite loop")
+
+    carry_units = get_carry_units()
+
+    carry = [x._to(u) for x, u in zip(carry, carry_units)]
 
     out_jaxpr, out_units = unitify_jaxpr(
         jaxpr.jaxpr,
-        tuple(x._unit for x in args),
+        consts_units + carry_units + xs_units,
         force_out_units=tuple((*carry_units, *(None for _ in range(num_ys)))),
     )
 
     out_vals: tuple[ArrayLike] = lax.scan_p.bind(
-        *(x._val for x in args),
+        *(x._val for x in consts),
+        *(x._val for x in carry),
+        *(x._val for x in xs),
         jaxpr=core.ClosedJaxpr(out_jaxpr, jaxpr.consts),
         num_carry=num_carry,
         num_consts=num_consts,
@@ -410,8 +475,8 @@ def _(
     return tuple(quantity(x, u) for x, u in zip(out_vals, out_units))
 
 
-@_rules_complex(lax.cond_p)
-def _(which: Quantity, *args: Quantity, branches: tuple[core.ClosedJaxpr, ...]):
+@rules_complex(lax.cond_p)
+def _(which: Qt, *args: Qt, branches: tuple[core.ClosedJaxpr, ...]):
     assert which._unit == dimensionless
 
     for x in branches:

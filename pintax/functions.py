@@ -2,7 +2,7 @@ from jax import numpy as jnp
 from jax._src.numpy.linalg import EighResult
 from jax._src.typing import ArrayLike
 
-from ._core import value_and_unit
+from ._primitives import value_and_unit
 from ._utils import cast
 
 

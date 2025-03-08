@@ -1,6 +1,7 @@
 import functools
+import inspect
 from dataclasses import dataclass
-from typing import Any, Callable, Concatenate, Sequence
+from typing import Any, Callable, Concatenate, Never, Sequence, TypeGuard
 
 import jax
 import jax._src.pretty_printer as pp
@@ -8,6 +9,7 @@ import jax.tree_util as jtu
 import numpy as np
 from equinox._pretty_print import tree_pp
 from jax import core
+from jax import util as ju
 from jax._src import linear_util as lu
 from jax._src import traceback_util
 from jax._src.traceback_util import api_boundary
@@ -146,19 +148,21 @@ is_leaf_t = Callable[[Any], bool] | None
 
 
 @dataclass
-class flattenctx:
+class flattenctx[Leaf]:
     f: Callable[..., Any]
-    is_leaf: is_leaf_t
+    is_leaf: Callable[[Any], TypeGuard[Leaf]]
     in_tree: jtu.PyTreeDef
 
     _out_store: lu.Store
 
     @staticmethod
-    def create(f: Callable[..., Any], args, kwargs, is_leaf: is_leaf_t = None):
+    def create(
+        f: Callable[..., Any], args, kwargs, is_leaf: Callable[[Any], TypeGuard[Leaf]]
+    ):
         args_flat, in_tree = jtu.tree_flatten((args, kwargs), is_leaf)
         return flattenctx(f, is_leaf, in_tree, lu.Store()), args_flat
 
-    def call(self, args_flat_trans: Sequence):
+    def call(self, args_flat_trans: Sequence[ArrayLike]) -> tuple[Leaf, ...]:
         args_trans, kwargs_trans = jtu.tree_unflatten(self.in_tree, args_flat_trans)
         ans = self.f(*args_trans, **kwargs_trans)
         out_bufs, out_tree = jtu.tree_flatten(ans, self.is_leaf)
@@ -170,10 +174,10 @@ class flattenctx:
         return self._out_store.val  # type: ignore
 
 
-def with_flatten[**P, T](
+def with_flatten[Leaf, **P, T](
     f: Callable[Concatenate[P], T],
-    handle_flat: Callable[[flattenctx, Sequence], Sequence],
-    is_leaf: Callable[[Any], bool] | None = None,
+    handle_flat: Callable[[flattenctx[Leaf], Sequence[Leaf]], Sequence[Leaf]],
+    is_leaf: Callable[[Any], TypeGuard[Leaf]],
 ) -> Callable[P, T]:
 
     @allow_autoreload
@@ -184,6 +188,10 @@ def with_flatten[**P, T](
         out_bufs_trans = handle_flat(fctx, args_flat)
         return jtu.tree_unflatten(fctx.out_tree, out_bufs_trans)
 
+    try:
+        setattr(wrapped, "__signature__", inspect.signature(f))
+    except:
+        pass
     return wrapped  # type: ignore
 
 
@@ -222,7 +230,7 @@ def dict_set[K, V](d: dict[K, V], k: K) -> Callable[[V], V]:
 def pretty_print(x: Any) -> pp.Doc:
     if isinstance(x, core.Tracer):
         return x._pretty_print()
-    return tree_pp(
+    ans = tree_pp(
         x,
         indent=2,
         short_arrays=False,
@@ -231,6 +239,10 @@ def pretty_print(x: Any) -> pp.Doc:
         truncate_leaf=lambda _: False,
     )
 
+    if isinstance(ans, pp._TextDoc):
+        return pp_join(*ans.text.splitlines())
+    return ans
+
 
 def _pp_doc(x: pp.Doc | str) -> pp.Doc:
     if isinstance(x, pp.Doc):
@@ -238,9 +250,39 @@ def _pp_doc(x: pp.Doc | str) -> pp.Doc:
     return pp.text(x)
 
 
+def pp_join(*docs: pp.Doc | str, sep: pp.Doc | str = pp.brk()) -> pp.Doc:
+    return pp.join(_pp_doc(sep), [_pp_doc(x) for x in docs])
+
+
 def pp_nested(*docs: pp.Doc | str) -> pp.Doc:
-    return pp.group(pp.nest(2, pp.join(pp.brk(), [_pp_doc(x) for x in docs])))
+    return pp.group(pp.nest(2, pp_join(*docs)))
 
 
-def check_arraylike(x: ArrayLike):
-    core.get_aval(x)
+def pp_obj(name: pp.Doc | str, *fields: pp.Doc | str):
+    # modified from equinox._pretty_print
+    _comma_sep = pp.concat([pp.text(","), pp.brk()])
+    nested = pp.concat(
+        [
+            pp.nest(
+                2,
+                pp.concat(
+                    [pp.brk(""), pp.join(_comma_sep, [_pp_doc(x) for x in fields])]
+                ),
+            ),
+            pp.brk(""),
+        ]
+    )
+    return pp.group(pp.concat([_pp_doc(name), pp.text("("), nested, pp.text(")")]))
+
+
+def check_arraylike(x: ArrayLike) -> ArrayLike:
+    _ = core.get_aval(x)
+    return x
+
+
+def unreachable(x: Never) -> Never:
+    raise RuntimeError("unreachable", x)
+
+
+def arraylike_to_float(x: ArrayLike) -> float:
+    return float(cast_unchecked()(x))

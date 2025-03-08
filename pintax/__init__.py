@@ -1,13 +1,16 @@
 from . import _rules, unstable
-from ._core import unitify, value_and_unit
-from ._helpers import dimensionless_zero, get_unit, get_value
-from ._registry import ureg
+from ._api import Quantity, areg, unitify, ureg
+from ._helpers import dimensionless_zero, get_unit, get_value, quantity
+from ._primitives import value_and_unit
 
 __all__ = [
+    "Quantity",
+    "areg",
+    "dimensionless_zero",
+    "quantity",
     "unitify",
     "ureg",
     "value_and_unit",
-    "dimensionless_zero",
 ]
 
 
@@ -16,12 +19,15 @@ class _dummy:
 
 
 for _x in [
+    Quantity,
+    dimensionless_zero,
     get_unit,
     get_value,
+    quantity,
+    type(areg),
     type(ureg),
     unitify,
     value_and_unit,
-    dimensionless_zero,
 ]:
     _x.__module__ = _dummy.__module__
 

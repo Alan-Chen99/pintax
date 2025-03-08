@@ -12,16 +12,16 @@ from pint import UnitRegistry
 
 from pintax import dimensionless_zero, unitify, ureg, value_and_unit
 from pintax._core import _global_ureg as gr
-from pintax.unstable import Quantity, make_unit, make_unit_p, qreg
+from pintax.unstable import Qt, make_unit, make_unit_p
 
 jax.config.update("jax_enable_x64", True)
 q = unitify(lambda: ureg.meter, unwrap_outs=False)()
 # zz = q + q
 
 
-def print_fn(x):
-    jax.debug.callback(lambda x: print(x * qreg.meter), x)
-    # jax.debug.callback(lambda x: print(x), x)
+# def print_fn(x):
+#     jax.debug.callback(lambda x: print(x * qreg.meter), x)
+#     # jax.debug.callback(lambda x: print(x), x)
 
 
 def testfn():
@@ -32,11 +32,11 @@ def testfn():
 @unitify
 def main():
 
-    return unitify(jnp.isinf)(qreg.meter)
+    # return unitify(jnp.isinf)(qreg.meter)
 
-    return unitify(lambda x: jnp.array(x))(qreg.meter)
+    # return unitify(lambda x: jnp.array(x))(qreg.meter)
 
-    print("trace", ureg.meter * 2)
+    # print("trace", ureg.meter * 2)
 
     ar = (jnp.arange(5) + 0.0) * ureg.meter
 
