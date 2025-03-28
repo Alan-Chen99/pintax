@@ -6,50 +6,43 @@ from jax import Array
 from jax import numpy as jnp
 from jax._src import ad_util, core, traceback_util
 from jax._src.interpreters import ad, batching
-from jax._src.traceback_util import api_boundary
 from jax._src.typing import ArrayLike
 from jax.interpreters import mlir
 
 from ._core import (
     Qt,
     Unit,
-    anyunit,
     dimensionless,
+    mul_units,
     quantity,
     rules_complex,
 )
 from ._utils import (
     cast_unchecked,
+    check_arraylike,
     dict_set,
 )
 
 traceback_util.register_exclusion(__file__)
 
 
-def _ensure_arr(x: ArrayLike) -> Array:
-    if not isinstance(x, Array):
-        x = jnp.array(x)
-        assert isinstance(x, Array)
-        return x
-    return x
-
-
-def make_unit(x: ArrayLike, unit: Unit) -> Array:
+def prim_make_unit(x: ArrayLike, unit: Unit) -> Array:
     assert isinstance(unit, Unit)
-    ans = make_unit_p.bind(_ensure_arr(x), unit=unit)
+    ans = make_unit_p.bind(check_arraylike(x), unit=unit)
     assert isinstance(ans, Array)
     return ans
 
 
-def value_and_unit(value: ArrayLike) -> tuple[Array, Array]:
-    val, unit = value_and_unit_p.bind(_ensure_arr(value))
+def prim_value_and_unit(value: ArrayLike) -> tuple[Array, Array]:
+    val, unit = value_and_unit_p.bind(check_arraylike(value))
     assert isinstance(val, Array)
     assert isinstance(unit, Array)
     return val, unit
 
 
-def convert_unit(value: ArrayLike, unit: ArrayLike) -> Array:
-    val = convert_unit_p.bind(_ensure_arr(value), _ensure_arr(unit))
+def prim_convert_unit(value: ArrayLike, unit: ArrayLike) -> Array:
+    """convert value to the unit of unit; return compares equal to value."""
+    val = convert_unit_p.bind(check_arraylike(value), check_arraylike(unit))
     assert isinstance(val, Array)
     return val
 
@@ -68,8 +61,6 @@ def _(x: Qt, /, *, unit: Unit):
     # assert x._unit in [dimensionless, anyunit]
     # return quantity(x._val, unit)
 
-    from ._rules import mul_units
-
     return quantity(x._val, mul_units(x._unit, unit))
 
 
@@ -77,7 +68,7 @@ def _(x: Qt, /, *, unit: Unit):
 def _(primals: tuple[ArrayLike], tangents: tuple[ArrayLike], /, *, unit: Unit):
     ans = make_unit_p.bind(*primals, unit=unit)
     (t,) = tangents
-    return ans, t / make_unit(1, unit)
+    return ans, t / prim_make_unit(1, unit)
 
 
 @make_unit_p.def_impl
@@ -102,6 +93,15 @@ def _(x: core.ShapedArray, y: core.ShapedArray, /):
 @rules_complex(convert_unit_p)
 def _(x: Qt, y: Qt, /) -> Qt:
     return x._to(y._unit)
+
+
+@dict_set(batching.primitive_batchers, convert_unit_p)
+def _(
+    batched_args: tuple[ArrayLike, ArrayLike], batch_dims: tuple[int | None, int | None]
+):
+    x, y = batched_args
+    x_b, _ = batch_dims
+    return convert_unit_p.bind(x, y), x_b
 
 
 # value_and_unit_p
@@ -137,9 +137,9 @@ def _(batched_args: tuple[ArrayLike], batch_dims: tuple[int]):
 
 @value_and_unit_p.def_impl
 def _(*_, **__):
-    raise TypeError(f"trying to use {value_and_unit} outside of unitify")
+    raise TypeError(f"trying to use {prim_value_and_unit} outside of unitify")
 
 
 @partial(mlir.register_lowering, value_and_unit_p)
 def _(*_, **__):
-    raise TypeError(f"trying to use {value_and_unit} outside of unitify")
+    raise TypeError(f"trying to use {prim_value_and_unit} outside of unitify")

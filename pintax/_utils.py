@@ -7,9 +7,9 @@ import jax
 import jax._src.pretty_printer as pp
 import jax.tree_util as jtu
 import numpy as np
-from equinox._pretty_print import tree_pp
-from jax import core
-from jax import util as ju
+from jax import Array
+from jax import numpy as jnp
+from jax._src import core
 from jax._src import linear_util as lu
 from jax._src import traceback_util
 from jax._src.traceback_util import api_boundary
@@ -36,7 +36,7 @@ class cast_unchecked[T]:
 
 
 class cast[T]:
-    def __init__(self, _: T):
+    def __init__(self, _: T | Empty_t = _empty):
         pass
 
     def __call__(self, a: T) -> T:
@@ -50,47 +50,6 @@ def safe_zip(*args):
     for arg in args[1:]:
         assert len(arg) == n, f"length mismatch: {list(map(len, args))}"
     return list(zip(*args))
-
-
-@dataclass
-class objwrapper:
-    obj: Any
-
-
-# for IPython autoreload
-class allow_autoreload(type):
-    def __new__(cls, func):
-        del func
-        return super().__new__(cls, "", (), {})
-
-    def __init__(self, func):
-        self.func = objwrapper(func)
-        self.__module__ = func.__module__
-
-    @property
-    def __call__(self):  # type: ignore
-        try:
-            return self.func.obj
-        except AttributeError:
-            # inspect.signature(self) goes here
-            return None
-
-    def __get__(self, obj, objtype=None):
-        del objtype
-        if obj is None:
-            return self
-        return self.func.obj.__get__(obj)
-
-    def __repr__(self):
-        return repr(self.func.obj)
-
-
-def compose_fn[**P, T, A](f1: Callable[P, T], f2: Callable[[T], A]) -> Callable[P, A]:
-    def inner(*args: P.args, **kwargs: P.kwargs):
-        t = f1(*args, **kwargs)
-        return f2(t)
-
-    return inner
 
 
 class ruleset[R](dict[core.Primitive, Callable[..., tuple[R, ...]]]):
@@ -113,6 +72,7 @@ class ruleset[R](dict[core.Primitive, Callable[..., tuple[R, ...]]]):
             def _setter1(f: Callable[..., R | Sequence[R]]):
                 assert prim not in self
 
+                @functools.wraps(f)
                 def inner(trace, *args, **kwargs):
                     return handle_res(f(trace, *args, **kwargs))
 
@@ -126,6 +86,7 @@ class ruleset[R](dict[core.Primitive, Callable[..., tuple[R, ...]]]):
             def _setter2(f: Callable[..., R | Sequence[R]]):
                 assert prim not in self
 
+                @functools.wraps(f)
                 def inner(trace, *args, **kwargs):
                     del trace
                     return handle_res(f(*args, **kwargs))
@@ -180,7 +141,6 @@ def with_flatten[Leaf, **P, T](
     is_leaf: Callable[[Any], TypeGuard[Leaf]],
 ) -> Callable[P, T]:
 
-    @allow_autoreload
     @functools.wraps(f)
     @api_boundary
     def wrapped(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -196,7 +156,8 @@ def with_flatten[Leaf, **P, T](
 
 
 def check_unit(x) -> Unit:
-    assert isinstance(x, Unit)
+    if not isinstance(x, Unit):
+        raise TypeError(f"expected pint.Unit, got {x} ({type(x)})")
     return x
 
 
@@ -228,20 +189,10 @@ def dict_set[K, V](d: dict[K, V], k: K) -> Callable[[V], V]:
 
 
 def pretty_print(x: Any) -> pp.Doc:
-    if isinstance(x, core.Tracer):
-        return x._pretty_print()
-    ans = tree_pp(
-        x,
-        indent=2,
-        short_arrays=False,
-        struct_as_array=False,
-        follow_wrapped=True,
-        truncate_leaf=lambda _: False,
-    )
-
-    if isinstance(ans, pp._TextDoc):
-        return pp_join(*ans.text.splitlines())
-    return ans
+    # if isinstance(x, core.Tracer):
+    #     return x._pretty_print()
+    ans = repr(x)
+    return pp_join(*ans.splitlines())
 
 
 def _pp_doc(x: pp.Doc | str) -> pp.Doc:
@@ -276,7 +227,10 @@ def pp_obj(name: pp.Doc | str, *fields: pp.Doc | str):
 
 
 def check_arraylike(x: ArrayLike) -> ArrayLike:
-    _ = core.get_aval(x)
+    if isinstance(x, ArrayLike):
+        return x
+    x = jnp.array(x)
+    assert isinstance(x, Array)
     return x
 
 
@@ -286,3 +240,9 @@ def unreachable(x: Never) -> Never:
 
 def arraylike_to_float(x: ArrayLike) -> float:
     return float(cast_unchecked()(x))
+
+
+def ensure_jax(x: ArrayLike) -> Array:
+    if isinstance(x, Array):
+        return x
+    return jnp.array(x)

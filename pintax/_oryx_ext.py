@@ -1,7 +1,6 @@
 import oryx
-from pint import Unit
 
-from ._core import rules
+from ._core import Unit, rules
 
 
 @rules(oryx.core.interpreters.harvest.sow_p)
