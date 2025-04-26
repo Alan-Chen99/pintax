@@ -11,7 +11,6 @@ from jax._src.core import Primitive
 
 from ._core import (
     PintaxError_forward,
-    PintaxNotImplementedError,
     PintaxTypeError,
     Qt,
     Unit,
@@ -25,7 +24,17 @@ from ._core import (
     rules,
     rules_complex,
 )
-from ._rules import dimensionless_or_err, sync_dims
+from ._rules import (
+    dimensionless_or_err,
+    sync_dims,
+    sync_dims_binop_t,
+    sync_dims_for_add,
+    sync_dims_for_concat,
+    sync_dims_for_div,
+    sync_dims_for_mul,
+    sync_dims_for_scatter_add,
+    sync_dims_for_sub,
+)
 
 traceback_util.register_exclusion(__file__)
 
@@ -94,22 +103,26 @@ _nounit_ops: list[Primitive] = [
     lax.cumprod_p,
 ]
 
-
-_mul_ops: list[Primitive] = [
-    lax.dot_general_p,
-    lax.mul_p,
-]
-
-_sametype_ops: list[Primitive] = [
-    ad_util.add_any_p,
-    lax.add_p,
+_same_unit_ops: list[Primitive] = [
     lax.clamp_p,
     lax.concatenate_p,
     lax.max_p,
     lax.min_p,
     lax.pad_p,
-    lax.sub_p,
 ]
+
+_binops: dict[Primitive, sync_dims_binop_t] = {
+    #
+    ad_util.add_any_p: sync_dims_for_add,
+    lax.add_p: sync_dims_for_add,
+    #
+    lax.sub_p: sync_dims_for_sub,
+    #
+    lax.dot_general_p: sync_dims_for_mul,
+    lax.mul_p: sync_dims_for_mul,
+    #
+    lax.div_p: sync_dims_for_div,
+}
 
 _sametype_nounit_ret: list[Primitive] = [
     lax.eq_p,
@@ -123,19 +136,19 @@ _sametype_nounit_ret: list[Primitive] = [
     lax.ne_p,
 ]
 
+_scatter_binops: dict[Primitive, sync_dims_binop_t] = {
+    lax.scatter_max_p: sync_dims_for_concat,
+    lax.scatter_min_p: sync_dims_for_concat,
+    lax.scatter_p: sync_dims_for_concat,
+    #
+    lax.scatter_add_p: sync_dims_for_scatter_add,
+    lax.scatter_sub_p: sync_dims_for_scatter_add,
+}
+
 
 @rules_complex(lax.convert_element_type_p)
 def _(x: Qt, new_dtype: np.dtype, **kwargs) -> Qt:
     assert isinstance(new_dtype, np.dtype)
-    if (
-        x._unit not in [dimensionless, anyunit]
-        and not np.issubdtype(x.dtype, np.integer)
-        and np.issubdtype(new_dtype, np.integer)
-    ):
-        raise PintaxError_forward(
-            ex_type=PintaxNotImplementedError,
-            msg="pintax for integers are not yet supported",
-        )
     ans = lax.convert_element_type_p.bind(x._val, new_dtype=new_dtype, **kwargs)
     return quantity(ans, x._unit)
 
@@ -169,32 +182,24 @@ def _(prim: Primitive):
     return func
 
 
-@rules.many(_mul_ops)
+@rules_complex.many(_same_unit_ops)
 def _(prim: Primitive):
-    def func(x: Unit, y: Unit, **kwargs):
-        return mul_units(x, y)
+    assert not prim.multiple_results
+
+    def func(*xs: Qt, **kwargs) -> Qt:
+        ans_u, xs = sync_dims(*xs)
+        return quantity(prim.bind(*(x._val for x in xs), **kwargs), ans_u)
 
     return func
 
 
-@rules(lax.div_p)
-def _(x: Unit, y: Unit):
-    return div_units(x, y)
-
-
-@rules(lax.sign_p)
-def _(x: Unit):
-    return dimensionless
-
-
-@rules_complex.many(_sametype_ops)
+@rules_complex.many(_binops.keys())
 def _(prim: Primitive):
     assert not prim.multiple_results
 
-    def func(*args: Qt, **kwargs):
-        u, args_ = sync_dims(*args)
-        ans = prim.bind(*(x._val for x in args_), **kwargs)
-        return quantity(ans, u)
+    def func(x: Qt, y: Qt, **kwargs) -> Qt:
+        (x_v, y_v), ans_u = _binops[prim](x, y)
+        return quantity(prim.bind(x_v, y_v, **kwargs), ans_u)
 
     return func
 
@@ -209,6 +214,24 @@ def _(prim: Primitive):
         return quantity(ans, dimensionless)
 
     return func
+
+
+@rules_complex.many(_scatter_binops.keys())
+def _(prim: Primitive):
+    assert not prim.multiple_results
+
+    def func(operand: Qt, scatter_indices: Qt, updates: Qt, **kwargs) -> Qt:
+        dimensionless_or_err(scatter_indices._unit)
+        (x_v, y_v), ans_u = _scatter_binops[prim](operand, updates)
+        ans = prim.bind(x_v, scatter_indices._val, y_v, **kwargs)
+        return quantity(ans, ans_u)
+
+    return func
+
+
+@rules(lax.sign_p)
+def _(x: Unit):
+    return dimensionless
 
 
 @rules(lax.integer_pow_p)
@@ -292,16 +315,6 @@ def _(operand: Unit, compute_uv: bool, **_):
         return (operand,)
 
 
-@rules_complex(lax.scatter_add_p)
-def _(operand: Qt, scatter_indices: Qt, updates: Qt, **kwargs):
-    dimensionless_or_err(scatter_indices._unit)
-    u, (operand, updates) = sync_dims(operand, updates)
-    ans = lax.scatter_add_p.bind(
-        operand._val, scatter_indices._val, updates._val, **kwargs
-    )
-    return quantity(ans, u)
-
-
 @rules_complex(lax.select_n_p)
 def _(which: Qt, *cases: Qt):
     assert which._unit in [dimensionless, anyunit]
@@ -313,14 +326,6 @@ def _(which: Qt, *cases: Qt):
 @rules(lax.device_put_p)
 def _(*args: Unit, **_):
     return args
-
-
-@rules_complex(lax.scatter_p)
-def _(operand: Qt, indices: Qt, updates: Qt, **kwargs) -> Qt:
-    dimensionless_or_err(indices._unit)
-    u, (operand, updates) = sync_dims(operand, updates)
-    ans = lax.scatter_p.bind(operand._val, indices._val, updates._val, **kwargs)
-    return quantity(ans, u)
 
 
 @rules(lax.sort_p)

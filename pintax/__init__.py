@@ -1,11 +1,12 @@
 import os as _os
 import sys as _sys
 
-from . import _rules as _
-from . import _rules_basic as _
-from . import _rules_controlflow as _
+from . import _primitives as _primitives
+from . import _rules as _rules
+from . import _rules_basic as _rules_basic
+from . import _rules_controlflow as _rules_controlflow
 from . import functions, unstable
-from ._api import Quantity, QuantityLike, Unit, areg, unitify, ureg
+from ._api import Quantity, QuantityLike, Unit, areg, quantity_to_arr, unitify, ureg
 from ._helpers import convert_unit, magnitude, quantity, sync_units
 
 dimensionless: Unit = ureg.dimensionless
@@ -36,6 +37,7 @@ if not _os.path.basename(_sys.argv[0]) == "sphinx-build":
         convert_unit,
         magnitude,
         quantity,
+        quantity_to_arr,
         sync_units,
         type(areg),
         type(ureg),

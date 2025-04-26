@@ -1,11 +1,10 @@
-from typing import Any, Callable
+from typing import Callable
 
+import numpy as np
 from jax import Array
 from jax import numpy as jnp
-from jax.typing import ArrayLike
 
-import pintax
-from pintax import Quantity, areg, quantity, unitify, ureg
+from pintax import Quantity, areg, unitify, ureg
 
 
 def check_one[*T](f: Callable[[*T], Quantity], *args: *T):
@@ -47,3 +46,8 @@ def test_arith():
         check_one(f, 3.0 * ureg.m, 5 * ureg.s)
         check_one(f, 3.0 * ureg.inch, 5 * ureg.s)
         check_one(f, 3.0 * ureg.inch, ureg.s)
+
+
+def test_methods():
+    q = np.arange(10) * ureg.m
+    assert (q.reshape(2, 5).flatten() == q).all()

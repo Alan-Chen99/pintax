@@ -1,14 +1,10 @@
-from typing import Any, Callable
-
 import jax
 import numpy as np
-from jax import Array, lax
+from jax import lax
 from jax import numpy as jnp
 from jax.experimental import io_callback
-from jax.typing import ArrayLike
 
-import pintax
-from pintax import Quantity, areg, quantity, unitify, ureg
+from pintax import areg, quantity, unitify
 
 
 @unitify

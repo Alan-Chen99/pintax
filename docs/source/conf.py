@@ -21,7 +21,7 @@ extensions = [
     # "sphinx.ext.linkcode",
     # "sphinx.ext.mathjax",
     "sphinx.ext.napoleon",
-    # "sphinx.ext.viewcode",
+    "sphinx.ext.viewcode",
     # "sphinx_toolbox.more_autodoc.overloads",
     #
     # "sphinx_tabs.tabs",

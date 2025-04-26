@@ -1,0 +1,54 @@
+================================================== short test summary info ===================================================
+FAILED test_pint_np.py::TestNumpyArrayManipulation::test_item - pintax.unstable.PintaxDimensionalityError: Cannot convert from 'meter' ([length]) to 'dimensionless' (dimensionless)
+FAILED test_pint_np.py::TestNumpyArrayManipulation::test_broadcast_arrays - pintax.unstable.PintaxTypeError: failed to process primitive concatenate:
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_unwrap - AssertionError: Comparing UnitTracer(Array([0.      , 3.141593], dtype=float32), 'radian') and [0, 3.141592653589793]. 
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_prod - TypeError: prod requires ndarray or scalar arguments, got <class 'list'> at position 0.
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_prod_numpy_func - TypeError: prod requires ndarray or scalar arguments, got <class 'list'> at position 0.
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_nanprod_numpy_func - pintax.unstable.PintaxDimensionalityError: failed to process primitive select_n:
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_sum_numpy_func - Failed: DID NOT RAISE <class 'pint.errors.OffsetUnitCalculusError'>
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_cumprod - pintax.unstable.PintaxTypeError: failed to process primitive cumprod: expected dimensionless, got meter
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_cumprod_numpy_func - pintax.unstable.PintaxTypeError: failed to process primitive cumprod: expected dimensionless, got meter
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_diff - pintax.unstable.PintaxDimensionalityError: failed to process primitive eq:
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_ediff1d - pintax.unstable.PintaxDimensionalityError: failed to process primitive eq:
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_gradient - pintax.unstable.PintaxTypeError: failed to process primitive mul:
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_trapz - AttributeError: module 'jax.numpy' has no attribute 'trapz'. Did you mean: 'trace'?
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_addition_with_scalar - TypeError: 'ureg_wrapped' object is not callable
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_power - pintax.unstable.PintaxTypeError: failed to process primitive pow: expected dimensionless, got meter
+FAILED test_pint_np.py::TestNumpyMathematicalFunctions::test_cbrt - AssertionError: Comparing UnitTracer(Array(10.000001, dtype=float32, weak_type=True), 'meter') and UnitTracer(Array(10, d...
+FAILED test_pint_np.py::TestNumpyUnclassified::test_tolist - pintax.unstable.PintaxDimensionalityError: Cannot convert from 'meter' ([length]) to 'dimensionless' (dimensionless)
+FAILED test_pint_np.py::TestNumpyUnclassified::test_fill - AttributeError: UnitTracer has no attribute fill
+FAILED test_pint_np.py::TestNumpyUnclassified::test_take - TypeError: take requires ndarray or scalar arguments, got <class 'list'> at position 1.
+FAILED test_pint_np.py::TestNumpyUnclassified::test_put - AttributeError: UnitTracer has no attribute put
+FAILED test_pint_np.py::TestNumpyUnclassified::test_sort - AssertionError: Comparing UnitTracer(Array([4, 5, 2, 3, 1, 6], dtype=int32), 'meter') and UnitTracer(Array([1, 2, 3, 4, 5...
+FAILED test_pint_np.py::TestNumpyUnclassified::test_compress - TypeError: compress requires ndarray or scalar arguments, got <class 'list'> at position 0.
+FAILED test_pint_np.py::TestNumpyUnclassified::test_compress_nep18 - TypeError: compress requires ndarray or scalar arguments, got <class 'list'> at position 0.
+FAILED test_pint_np.py::TestNumpyUnclassified::test_searchsorted - TypeError: searchsorted requires ndarray or scalar arguments, got <class 'list'> at position 1.
+FAILED test_pint_np.py::TestNumpyUnclassified::test_any_numpy_func - pintax.unstable.PintaxTypeError: failed to process primitive reduce_or: expected dimensionless, got meter
+FAILED test_pint_np.py::TestNumpyUnclassified::test_all_numpy_func - pintax.unstable.PintaxTypeError: failed to process primitive reduce_and: expected dimensionless, got meter
+FAILED test_pint_np.py::TestNumpyUnclassified::test_ptp - AttributeError: module 'jax.numpy' has no attribute 'lib'
+FAILED test_pint_np.py::TestNumpyUnclassified::test_clip_numpy_func - pintax.unstable.PintaxTypeError: failed to process primitive max:
+FAILED test_pint_np.py::TestNumpyUnclassified::test_round - AssertionError: Comparing UnitTracer(
+FAILED test_pint_np.py::TestNumpyUnclassified::test_mean_numpy_func - pintax.unstable.PintaxTypeError: failed to process primitive div:
+FAILED test_pint_np.py::TestNumpyUnclassified::test_average_numpy_func - TypeError: average requires ndarray or scalar arguments, got <class 'list'> at position 1.
+FAILED test_pint_np.py::TestNumpyUnclassified::test_std_numpy_func - pintax.unstable.PintaxTypeError: failed to process primitive div:
+FAILED test_pint_np.py::TestNumpyUnclassified::test_cumprod - pintax.unstable.PintaxTypeError: failed to process primitive cumprod: expected dimensionless, got meter
+FAILED test_pint_np.py::TestNumpyUnclassified::test_getitem - Failed: DID NOT RAISE <class 'IndexError'>
+FAILED test_pint_np.py::TestNumpyUnclassified::test_setitem_mixed_masked - AttributeError: module 'jax.numpy' has no attribute 'ma'
+FAILED test_pint_np.py::TestNumpyUnclassified::test_equal - pintax.unstable.PintaxDimensionalityError: failed to process primitive eq:
+FAILED test_pint_np.py::TestNumpyUnclassified::test_shape - AttributeError: property 'shape' of 'UnitTracer' object has no setter
+FAILED test_pint_np.py::TestNumpyUnclassified::test_trim_zeros_numpy_func - jax.errors.ConcretizationTypeError: Abstract tracer value encountered where concrete value is expected: traced array with...
+FAILED test_pint_np.py::TestNumpyUnclassified::test_result_type_numpy_func - AssertionError: assert dtype('int32') == dtype('int64')
+FAILED test_pint_np.py::TestNumpyUnclassified::test_nan_to_num_numpy_func - pintax.unstable.PintaxDimensionalityError: failed to process primitive select_n:
+FAILED test_pint_np.py::TestNumpyUnclassified::test_isclose_numpy_func - pintax.unstable.PintaxDimensionalityError: failed to process primitive add:
+FAILED test_pint_np.py::TestNumpyUnclassified::test_interp_numpy_func - pintax.unstable.PintaxDimensionalityError: failed to process primitive le:
+FAILED test_pint_np.py::TestNumpyUnclassified::test_where - pint.errors.UndefinedUnitError: 'Quantity' is not defined in the unit registry
+FAILED test_pint_np.py::TestNumpyUnclassified::test_isin - pintax.unstable.PintaxDimensionalityError: failed to process primitive eq:
+FAILED test_pint_np.py::TestNumpyUnclassified::test_copyto - AttributeError: module 'jax.numpy' has no attribute 'copyto'. Did you mean: 'copy'?
+FAILED test_pint_np.py::TestNumpyUnclassified::test_sliding_window_view - AttributeError: module 'jax.numpy' has no attribute 'lib'
+FAILED test_pint_np.py::TestNumpyUnclassified::test_delete - TypeError: delete requires ndarray or scalar arguments, got <class 'list'> at position 1.
+FAILED test_pint_np.py::TestNumpyUnclassified::test_ndarray_downcast - Failed: DID NOT WARN. No warnings of type (<class 'pint.errors.UnitStrippedWarning'>,) were emitted.
+FAILED test_pint_np.py::TestNumpyUnclassified::test_ndarray_downcast_with_dtype - Failed: DID NOT WARN. No warnings of type (<class 'pint.errors.UnitStrippedWarning'>,) were emitted.
+FAILED test_pint_np.py::TestNumpyUnclassified::test_pad - pintax.unstable.PintaxTypeError: failed to process primitive pad:
+FAILED test_pint_np.py::TestNumpyUnclassified::test_allclose - pintax.unstable.PintaxDimensionalityError: failed to process primitive add:
+FAILED test_pint_np.py::TestNumpyUnclassified::test_intersect1d - jax.errors.ConcretizationTypeError: Abstract tracer value encountered where concrete value is expected: traced array with...
+=================== 52 failed, 104 passed, 6 skipped, 6 xfailed, 6 warnings, 13 subtests passed in 33.34s ====================

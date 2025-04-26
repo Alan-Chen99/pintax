@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import Callable, Final, Literal, Sequence, final
+from types import TracebackType
+from typing import Callable, Concatenate, Final, Literal, final
 
 import equinox as eqx
 import jax._src.pretty_printer as pp
@@ -23,7 +25,6 @@ from pint import UnitRegistry
 from pint.errors import DimensionalityError, PintTypeError
 
 from ._utils import (
-    cast_unchecked,
     check_arraylike,
     check_unit,
     dtype_of,
@@ -33,7 +34,9 @@ from ._utils import (
     pp_nested,
     pp_obj,
     pretty_print,
+    property_method,
     ruleset,
+    shape_of,
     unreachable,
 )
 
@@ -53,8 +56,8 @@ anyunit: Literal[AnyUnit.ANY] = AnyUnit.ANY
 
 Unit = pint.Unit | AnyUnit
 
-_global_ureg = UnitRegistry()
-dimensionless = _global_ureg.dimensionless
+global_ureg = UnitRegistry()
+dimensionless = global_ureg.dimensionless
 
 
 def pp_unit(u: Unit) -> pp.Doc:
@@ -66,7 +69,7 @@ def pp_unit(u: Unit) -> pp.Doc:
 
 
 def pint_registry() -> UnitRegistry:
-    return _global_ureg
+    return global_ureg
 
 
 class PintaxError(Exception):
@@ -81,8 +84,12 @@ class PintaxTypeError(PintaxError, PintTypeError):
     pass
 
 
-class PintaxDimensionalityError(PintaxTypeError, DimensionalityError):
-    def __init__(self, _units1: Unit, _units2: Unit):
+class PintaxDimensionalityError(  # pyright: ignore[reportUnsafeMultipleInheritance]
+    PintaxTypeError, DimensionalityError
+):
+    def __init__(  # pyright: ignore[reportMissingSuperCall]
+        self, _units1: Unit, _units2: Unit
+    ):
         self._units1 = _units1
         self._units2 = _units2
 
@@ -113,30 +120,53 @@ class PintaxZeroDivisionError(PintaxError, ZeroDivisionError):
 
 
 class PintaxError_forward(Exception):
-    ex_type: Callable[[pp.Doc], PintaxError]
-    msg: pp.Doc
-
     def __init__(
         self,
         *,
         ex_type: Callable[[pp.Doc], PintaxError] = PintaxRuntimeError,
         msg: str | pp.Doc,
+        throw_from: Exception | None = None,
     ):
+        super().__init__()
         self.ex_type = ex_type
         if isinstance(msg, str):
             msg = pp.text(msg)
         self.msg = msg
+        self.throw_from = throw_from
 
-    def unwrap(self):
-        return self.ex_type(self.msg)
+    def unwrap(self, msg: str | pp.Doc | None = None):
+        if msg is None:
+            msg = self.msg
+        elif isinstance(msg, str):
+            msg = pp.text(msg)
+        ans = self.ex_type(msg)
+        if ans.__traceback__ is None and self.__traceback__ is not None:
+            tb = self.__traceback__
+            while tb.tb_next is not None:
+                tb = tb.tb_next
+            frame = tb.tb_frame
+            ans.__traceback__ = TracebackType(
+                None, frame, tb_lasti=frame.f_lasti, tb_lineno=frame.f_lineno
+            )
 
+        return ans
 
-def _unitify_check_ret(x: Qt, trace: UnitTrace) -> Qt:
-    if isinstance(x._val, UnitTracer) and x._val._trace is trace:
-        raise TypeError()
-    if isinstance(x._val, Qt):
-        raise TypeError()
-    return x
+    @staticmethod
+    def from_ex(ex: Exception):
+        try:
+            msg = pp_join(
+                pp_join(
+                    "(",
+                    pp.color(pp.text(type(ex).__name__), foreground=pp.Color.RED),
+                    ")",
+                    sep="",
+                ),
+                *(str(ex).splitlines()),
+            )
+        except Exception as fmt_ex:
+            msg = pp.text(f"<{fmt_ex} while formatting exception that caused this>")
+
+        return PintaxError_forward(msg=msg, throw_from=ex)
 
 
 @final
@@ -153,6 +183,7 @@ class Qt(eqx.Module):
     _unit: Unit = eqx.field(static=True)
 
     def __init__(self, *, _val: ArrayLike, _unit: Unit):
+        super().__init__()
         assert isinstance(_unit, Unit)
         assert not isinstance(_val, Qt)
         self._val = _val
@@ -168,7 +199,7 @@ class Qt(eqx.Module):
 
     @property
     def shape(self) -> Shape:
-        return self.aval.shape  # type: ignore
+        return shape_of(self._val)
 
     def _to(self, new_unit: Unit) -> Qt:
         if self._unit == new_unit:
@@ -184,23 +215,24 @@ class Qt(eqx.Module):
     def _to_slow(self, new_unit: pint.Unit) -> Qt:
         assert self._unit != anyunit
         dtype = dtype_of(self._val)
-        # assert not np.issubdtype(dtype, np.integer)
         try:
-            ans = _global_ureg.Quantity(self._val, self._unit).to(new_unit)
-        except pint.DimensionalityError as e:
+            ans = global_ureg.Quantity(self._val, self._unit).to(new_unit)
+        except pint.DimensionalityError:
             raise PintaxDimensionalityError(self._unit, new_unit)._forward() from None
+        except pint.PintError as e:
+            raise PintaxError_forward.from_ex(e) from None
         assert ans.units == new_unit
         assert isinstance(ans.magnitude, Array)
         if ans.magnitude.dtype == dtype:
             out_mag = ans.magnitude
         else:
-            if np.issubdtype(dtype, np.integer) and not np.issubdtype(
-                ans.magnitude.dtype, np.integer
+            if not np.issubdtype(dtype, np.inexact) and np.issubdtype(
+                ans.magnitude.dtype, np.inexact
             ):
                 raise PintaxError_forward(
                     ex_type=PintaxTypeError,
                     msg=pp_nested(
-                        "not possible to convert an integer value",
+                        "not possible to convert an integral value",
                         pretty_print(self._val),
                         "of",
                         pp_unit(self._unit),
@@ -220,6 +252,7 @@ class Qt(eqx.Module):
         if (
             isinstance(v, np.ndarray)
             and v.shape == ()
+            and v.dtype != np.bool
             and (v.dtype == float0 or v == 0.0 or np.isinf(v) or np.isnan(v))
         ):
             return quantity(v, anyunit)
@@ -227,12 +260,7 @@ class Qt(eqx.Module):
         return quantity(v, dimensionless)
 
     def _pretty_print(self, prefix: pp.Doc = pp.text("_Quantity_internal")) -> pp.Doc:
-        val = pretty_print(self._val)
-        return pp_obj(
-            prefix,
-            pretty_print(self._val),
-            pp_unit(self._unit),
-        )
+        return pp_obj(prefix, pretty_print(self._val), pp_unit(self._unit))
 
     def __repr__(self):
         return self._pretty_print().format()
@@ -244,14 +272,14 @@ def quantity(val: ArrayLike, unit: Unit):
 
 class UnitTracer(core.Tracer):
     _q: Qt
-    _trace: Final[UnitTrace]
+    _trace: UnitTrace  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def __init__(self, trace: UnitTrace, val: Qt):
+        super().__init__(trace)
         assert isinstance(trace, UnitTrace)
         assert isinstance(val, Qt)
         if isinstance(val._val, UnitTracer):
             assert val._val._trace is not trace
-        self._trace = trace
         self._q = val
 
     @property
@@ -259,8 +287,8 @@ class UnitTracer(core.Tracer):
         return self._q._val
 
     @property
-    def units(self) -> Array:
-        return UnitTracer(self._trace, quantity(1, self._q._unit))
+    def units(self) -> Unit:
+        return self._q._unit
 
     m = magnitude
     u = units
@@ -297,7 +325,9 @@ class UnitTracer(core.Tracer):
     def _force_dimensionless_arr(self) -> Array:
         return self._ensure_jax(self._force_dimensionless())
 
-    def to_concrete_value(self):
+    def to_concrete_value(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self,
+    ) -> ArrayLike | None:
         if self._q._unit in [dimensionless, anyunit]:
             v = self._q._val
             if isinstance(v, core.Tracer):
@@ -305,43 +335,43 @@ class UnitTracer(core.Tracer):
             return v
         return None
 
-    @property
-    def __array__(self):
+    @property_method
+    def __array__(self):  # pyright: ignore[reportIncompatibleMethodOverride]
         return self._force_dimensionless_arr().__array__
 
-    @property
+    @property_method
     def __float__(self):
         return self._force_dimensionless_arr().__float__
 
-    @property
+    @property_method
     def __bool__(self):
         return self._force_dimensionless_arr().__bool__
 
-    @property
+    @property_method
     def __int__(self):
         return self._force_dimensionless_arr().__int__
 
-    @property
+    @property_method
     def item(self):
         return self._force_dimensionless_arr().item
 
-    @property
-    def tolist(self):
+    @property_method
+    def tolist(self):  # pyright: ignore[reportIncompatibleMethodOverride]
         return self._force_dimensionless_arr().tolist
 
     @staticmethod
     def _unpickle(m: ArrayLike, u_: str | AnyUnit) -> Array:
-        from ._primitives import prim_make_unit
+        from ._primitives import prim_mul_unit
 
         if isinstance(u_, str):
-            u = _global_ureg.Unit(u_)
+            u = global_ureg.Unit(u_)
         elif u_ is anyunit:
             u = u_
         else:
-            return unreachable(u_)
-        return prim_make_unit(m, u)
+            unreachable(u_)
+        return prim_mul_unit(m, u)
 
-    def __reduce__(self):
+    def __reduce__(self):  # pyright: ignore[reportIncompatibleMethodOverride]
         if self._q._unit is anyunit:
             u_ = anyunit
         else:
@@ -358,7 +388,7 @@ class _pintax_raise:
     from_ex: Exception | None
 
     def do_raise(self):
-        __tracebackhide_ = True
+        __tracebackhide__ = True
         raise self.ex from self.from_ex
 
     def __repr__(self):
@@ -370,10 +400,6 @@ class UnitTrace(core.Trace[UnitTracer]):
     def __init__(self, parent: core.Trace):
         self._parent = parent
         super().__init__()
-
-    def invalidate(self):
-        print("invalidate:", self, id(self))
-        super().invalidate()
 
     def handle_primitive_arg(self, x: ArrayLike) -> Qt:
         assert not isinstance(x, Qt)
@@ -392,7 +418,7 @@ class UnitTrace(core.Trace[UnitTracer]):
 
         # if primitive is pjit.pjit_p:
         #     with core.set_current_trace(self):
-        #         return tuple(_debug_pjit_direct(*tracers, **params))
+        #         return tuple(debug_pjit_direct(*tracers, **params))
 
         with core.set_current_trace(self):
             args = [self.handle_primitive_arg(x) for x in tracers]
@@ -449,39 +475,11 @@ class UnitTrace(core.Trace[UnitTracer]):
             raise
         except Exception as ex:
 
-            extra_msg = pp.text("")
-            ex_type = PintaxRuntimeError
-
-            if isinstance(ex, PintaxError_forward):
-                ex_type = ex.ex_type
-                if ex.msg is not None:
-                    extra_msg = pp.group(ex.msg)
-                ex = None
-            else:
-                # extra_msg = pp.text(f"{type(ex)}")
-                try:
-                    extra_msg = pp_join(
-                        pp_join(
-                            "(",
-                            pp.color(
-                                pp.text(type(ex).__name__),
-                                foreground=pp.Color.RED,
-                            ),
-                            ")",
-                            sep="",
-                        ),
-                        *(str(ex).splitlines()),
-                    )
-                except Exception as fmt_ex:
-                    extra_msg = pp.text(
-                        f"<{fmt_ex} while formatting exception that caused this>"
-                    )
+            if not isinstance(ex, PintaxError_forward):
+                ex = PintaxError_forward.from_ex(ex)
 
             parts = [
-                pp_nested(
-                    pp.text(f"failed to process primitive {primitive}:"),
-                    extra_msg,
-                ),
+                pp_nested(pp.text(f"failed to process primitive {primitive}:"), ex.msg)
             ]
             if len(tracers) > 0:
                 parts.append(
@@ -502,7 +500,7 @@ class UnitTrace(core.Trace[UnitTracer]):
 
             desc = pp.join(pp.brk(), parts)
             # put to seperate function to prevent tools like pytest to display this whole function
-            unreachable(_pintax_raise(ex_type(desc), ex).do_raise())
+            unreachable(_pintax_raise(ex.unwrap(desc), ex.throw_from).do_raise())
 
     def process_custom_jvp_call(
         self,
@@ -524,17 +522,74 @@ rules_complex = ruleset[Qt]()
 
 
 @contextlib.contextmanager
-def with_unit_trace():
+def with_unit_trace_():
     with core.take_current_trace() as parent:
         assert parent is not None
         trace = UnitTrace(parent)
-        with core.set_current_trace(trace, check_leaks=True):
-            yield trace
+        _ctx = core.set_current_trace(trace)
+        with _ctx:
+            ans = yield trace
+            del trace
+            _ctx.check_leaks = True  # pyright: ignore[reportAttributeAccessIssue]
+            return ans
 
 
-def _debug_pjit_direct(*args, jaxpr: core.ClosedJaxpr, **_):
+def with_unit_trace[**P, R](
+    f: Callable[Concatenate[UnitTrace, P], R],
+) -> Callable[P, R]:
+
+    def inner(*args: P.args, **kwargs: P.kwargs) -> R:
+        __tracebackhide__ = True
+        with with_unit_trace_() as trace:
+            ans = f(trace, *args, **kwargs)
+            del trace, args, kwargs
+            return ans
+
+    return inner
+
+
+def debug_pjit_direct(*args, jaxpr: core.ClosedJaxpr, **_):
     assert len(jaxpr.consts) == 0
     return core.eval_jaxpr(jaxpr.jaxpr, jaxpr.consts, *args)
+
+
+def is_multiplicative(u: Unit) -> bool:
+    if u == anyunit:
+        return True
+    assert u._REGISTRY == global_ureg
+    return all(global_ureg._is_multiplicative(name) for name in u._units.keys())
+
+
+def as_multiplicative(u: Unit) -> Unit:
+    if u == anyunit:
+        return u
+    nonmul = [
+        name for name in u._units.keys() if not global_ureg._is_multiplicative(name)
+    ]
+    if len(nonmul) == 0:
+        return u
+    assert len(nonmul) == 1
+    delta_u = u._units.rename(nonmul[0], "delta_" + nonmul[0])
+    return global_ureg.Unit(delta_u)
+
+
+def assert_multiplicative(
+    x: Qt | Unit, ex_type: Callable[[pp.Doc], PintaxError] = PintaxTypeError
+):
+    if isinstance(x, Qt):
+        if not is_multiplicative(x._unit):
+            raise PintaxError_forward(
+                ex_type=ex_type,
+                msg=pp_nested(
+                    "quantity with non multiplicative unit:", x._pretty_print()
+                ),
+            )
+    else:
+        if not is_multiplicative(x):
+            raise PintaxError_forward(
+                ex_type=ex_type,
+                msg=pp_nested("non multiplicative unit:", pretty_print(x)),
+            )
 
 
 def mul_units(x: Unit, y: Unit):

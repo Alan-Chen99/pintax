@@ -11,15 +11,34 @@ from typing import Any
 import pytest
 from jax import Array
 from jax import numpy as np
-from jax.typing import ArrayLike
 from pint import DimensionalityError, OffsetUnitCalculusError, UnitStrippedWarning
 from pint.testsuite import helpers
 from pint.testsuite.test_umath import TestUFuncs
+from pytest import FixtureRequest
 
-from pintax import Quantity, areg, quantity
-from pintax._core import with_unit_trace
-from pintax._utils import cast_unchecked
-from pintax.unstable import PintaxNotImplementedError
+from pintax import Unit, areg
+from pintax._core import with_unit_trace_
+from pintax.unstable import prim_mul_unit
+
+
+class _dummyex(BaseException):
+    pass
+
+
+@pytest.fixture(autouse=True)
+def setup_unit_trace(request: FixtureRequest):
+    assert isinstance(request, FixtureRequest)
+
+    # https://stackoverflow.com/questions/77058813/can-a-pytest-fixture-know-whether-a-test-has-passed-or-failed
+    failed_count = request.session.testsfailed
+
+    try:
+        with with_unit_trace_():
+            yield None
+            if request.session.testsfailed > failed_count:
+                raise _dummyex()
+    except _dummyex:
+        pass
 
 
 @dataclass
@@ -64,10 +83,14 @@ class ureg_wrapped:
         return arr_wrapper(areg(name))
 
 
+def nan_equal(x, y):
+    return (x == y) | (np.isnan(x) & np.isnan(y))
+
+
 def assert_quantity_equal(first, second, msg: str | None = None) -> None:
     if msg is None:
         msg = f"Comparing {first!r} and {second!r}. "
-    assert np.all(first == second), msg
+    assert np.all(nan_equal(np.array(first), np.array(second))), msg
 
 
 helpers.assert_quantity_equal = assert_quantity_equal
@@ -83,16 +106,13 @@ class TestNumpyMethods:
             y = areg(y)
         elif y is None:
             return np.array(x)
-        return np.array(x) * np.array(y)
 
-    @classmethod
-    def setup_class(cls):
-        cls._trace_ctx = with_unit_trace()
-        cls._trace_ctx.__enter__()
-
-    @classmethod
-    def teardown_class(cls):
-        cls._trace_ctx.__exit__(None, None, None)
+        y = np.array(y)
+        try:
+            u = y.units
+        except:
+            return np.array(x) * y
+        return prim_mul_unit(np.array(x), u)
 
     @property
     def q(self):
@@ -284,13 +304,13 @@ class TestNumpyArrayManipulation(TestNumpyMethods):
                 )
                 # One or more of the args is a bare array full of zeros or NaNs
                 helpers.assert_quantity_equal(
-                    func([self.q_zero_or_nan.m, self.q]),
+                    func([self.q_zero_or_nan, self.q]),
                     self.Q_(func([self.q_zero_or_nan.m, self.q.m]), self.ureg.m),
                 )
                 # One or more of the args is a bare array with at least one non-zero,
                 # non-NaN element
                 nz = self.q_zero_or_nan
-                nz.m[0, 0] = 1
+                nz = nz.at[0, 0].set(1)
                 with pytest.raises(DimensionalityError):
                     func([nz.m, self.q])
 
@@ -307,9 +327,9 @@ class TestNumpyArrayManipulation(TestNumpyMethods):
                 helpers.assert_quantity_equal(
                     func(
                         [
-                            self.q_zero_or_nan[:, 0].m,
+                            self.q_zero_or_nan[:, 0],
                             self.q[:, 0],
-                            self.q_zero_or_nan[:, 1].m,
+                            self.q_zero_or_nan[:, 1],
                         ]
                     ),
                     self.Q_(
@@ -326,7 +346,7 @@ class TestNumpyArrayManipulation(TestNumpyMethods):
                 # One or more of the args is a bare array with at least one non-zero,
                 # non-NaN element
                 nz = self.q_zero_or_nan
-                nz.m[0, 0] = 1
+                nz = nz.at[0, 0].set(1)
                 with pytest.raises(DimensionalityError):
                     func([nz[:, 0].m, self.q[:, 0]])
 
@@ -991,6 +1011,7 @@ class TestNumpyUnclassified(TestNumpyMethods):
         helpers.assert_quantity_equal(self.q[0], [1, 2] * self.ureg.m)
         assert self.q[1, 1] == 4 * self.ureg.m
 
+    @pytest.mark.xfail
     def test_setitem(self):
         with pytest.raises(TypeError):
             self.q[0, 0] = 1

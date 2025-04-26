@@ -1,19 +1,15 @@
 import functools
-import inspect
-from dataclasses import dataclass
-from typing import Any, Callable, Concatenate, Never, Sequence, TypeGuard
+from collections.abc import Iterable, Sequence
+from typing import Any, Callable, Concatenate, Never
 
 import jax
 import jax._src.pretty_printer as pp
-import jax.tree_util as jtu
 import numpy as np
 from jax import Array
 from jax import numpy as jnp
-from jax._src import core
-from jax._src import linear_util as lu
-from jax._src import traceback_util
-from jax._src.traceback_util import api_boundary
-from jax._src.typing import ArrayLike
+from jax import tree_util as jtu
+from jax._src import core, traceback_util
+from jax._src.typing import ArrayLike, DType, Shape
 from jax._src.util import weakref_lru_cache
 from pint import Unit
 
@@ -33,6 +29,10 @@ class cast_unchecked[T]:
 
     def __call__(self, a) -> T:
         return a
+
+
+def cast_unchecked_(x):
+    return cast_unchecked()(x)
 
 
 class cast[T]:
@@ -96,63 +96,13 @@ class ruleset[R](dict[core.Primitive, Callable[..., tuple[R, ...]]]):
 
             return _setter2
 
-    def many(self, prims: Sequence[core.Primitive], trace: bool = False):
+    def many(self, prims: Iterable[core.Primitive], trace: bool = False):
         def _setter(f: Callable[[core.Primitive], Callable[..., R | Sequence[R]]]):
             for prim in prims:
                 self(prim, trace=trace)(f(prim))
             return f
 
         return _setter
-
-
-is_leaf_t = Callable[[Any], bool] | None
-
-
-@dataclass
-class flattenctx[Leaf]:
-    f: Callable[..., Any]
-    is_leaf: Callable[[Any], TypeGuard[Leaf]]
-    in_tree: jtu.PyTreeDef
-
-    _out_store: lu.Store
-
-    @staticmethod
-    def create(
-        f: Callable[..., Any], args, kwargs, is_leaf: Callable[[Any], TypeGuard[Leaf]]
-    ):
-        args_flat, in_tree = jtu.tree_flatten((args, kwargs), is_leaf)
-        return flattenctx(f, is_leaf, in_tree, lu.Store()), args_flat
-
-    def call(self, args_flat_trans: Sequence[ArrayLike]) -> tuple[Leaf, ...]:
-        args_trans, kwargs_trans = jtu.tree_unflatten(self.in_tree, args_flat_trans)
-        ans = self.f(*args_trans, **kwargs_trans)
-        out_bufs, out_tree = jtu.tree_flatten(ans, self.is_leaf)
-        self._out_store.store(out_tree)
-        return tuple(out_bufs)
-
-    @property
-    def out_tree(self) -> jtu.PyTreeDef:
-        return self._out_store.val  # type: ignore
-
-
-def with_flatten[Leaf, **P, T](
-    f: Callable[Concatenate[P], T],
-    handle_flat: Callable[[flattenctx[Leaf], Sequence[Leaf]], Sequence[Leaf]],
-    is_leaf: Callable[[Any], TypeGuard[Leaf]],
-) -> Callable[P, T]:
-
-    @functools.wraps(f)
-    @api_boundary
-    def wrapped(*args: P.args, **kwargs: P.kwargs) -> T:
-        fctx, args_flat = flattenctx.create(f, args, kwargs, is_leaf)
-        out_bufs_trans = handle_flat(fctx, args_flat)
-        return jtu.tree_unflatten(fctx.out_tree, out_bufs_trans)
-
-    try:
-        setattr(wrapped, "__signature__", inspect.signature(f))
-    except:
-        pass
-    return wrapped  # type: ignore
 
 
 def check_unit(x) -> Unit:
@@ -162,7 +112,7 @@ def check_unit(x) -> Unit:
 
 
 def weakref_lru_cache_[F: Callable](f: F) -> F:
-    return weakref_lru_cache(f)  # type: ignore
+    return cast_unchecked_(weakref_lru_cache(f))
 
 
 def _wrap_jit[F: Callable, **P](
@@ -174,10 +124,16 @@ def _wrap_jit[F: Callable, **P](
 jit = _wrap_jit(jax.jit)
 
 
-def dtype_of(x: ArrayLike) -> np.dtype:
-    dtype = core.get_aval(x).dtype  # type: ignore
+def dtype_of(x: ArrayLike | core.AbstractValue) -> np.dtype:
+    dtype = core.get_aval(x).dtype  # pyright: ignore[reportAttributeAccessIssue]
     assert isinstance(dtype, np.dtype)
     return dtype
+
+
+def shape_of(x: ArrayLike | core.AbstractValue) -> Shape:
+    if isinstance(x, core.AbstractValue):
+        return x.shape  # pyright: ignore[reportAttributeAccessIssue]
+    return jnp.shape(x)
 
 
 def dict_set[K, V](d: dict[K, V], k: K) -> Callable[[V], V]:
@@ -192,7 +148,7 @@ def pretty_print(x: Any) -> pp.Doc:
     # if isinstance(x, core.Tracer):
     #     return x._pretty_print()
     ans = repr(x)
-    return pp_join(*ans.splitlines())
+    return pp_join(*ans.splitlines(), sep=pp.brk(" " * 100))
 
 
 def _pp_doc(x: pp.Doc | str) -> pp.Doc:
@@ -201,7 +157,9 @@ def _pp_doc(x: pp.Doc | str) -> pp.Doc:
     return pp.text(x)
 
 
-def pp_join(*docs: pp.Doc | str, sep: pp.Doc | str = pp.brk()) -> pp.Doc:
+def pp_join(*docs: pp.Doc | str, sep: pp.Doc | str | None = None) -> pp.Doc:
+    if sep is None:
+        sep = pp.brk()
     return pp.join(_pp_doc(sep), [_pp_doc(x) for x in docs])
 
 
@@ -227,6 +185,7 @@ def pp_obj(name: pp.Doc | str, *fields: pp.Doc | str):
 
 
 def check_arraylike(x: ArrayLike) -> ArrayLike:
+    x = cast_unchecked()(x)
     if isinstance(x, ArrayLike):
         return x
     x = jnp.array(x)
@@ -246,3 +205,21 @@ def ensure_jax(x: ArrayLike) -> Array:
     if isinstance(x, Array):
         return x
     return jnp.array(x)
+
+
+def property_method[S, **P, R](
+    prop: Callable[[S], Callable[P, R]],
+):
+    def inner(self: S, *args: P.args, **kwargs: P.kwargs) -> R:
+        return prop(self)(*args, **kwargs)
+
+    return inner
+
+
+def _tree_map[T](
+    f: Callable, tree: T, *rest: T, is_leaf: Callable[[Any], bool] | None = None
+) -> T:
+    assert False
+
+
+tree_map = cast_unchecked(_tree_map)(jtu.tree_map)

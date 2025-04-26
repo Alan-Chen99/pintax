@@ -10,8 +10,8 @@ incurs no additional runtime cost for jitted functions.
 
 Compared to `jpu <https://github.com/dfm/jpu>`_, this library allows you
 to use ``jax.numpy`` or ``jax.lax`` apis directly, and that you can
-:func:`pintax.unitify` any existing function that makes use of
-``jax.numpy`` or ``jax.lax`` apis.
+:func:`unitify` any existing function that makes use of ``jax.numpy`` or
+``jax.lax`` apis.
 
 This library uses internal JAX apis. You may need to pin JAX to the
 version pinned in ``poetry.lock``.

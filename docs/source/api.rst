@@ -53,3 +53,5 @@
 .. autofunction:: magnitude
 
 .. autofunction:: sync_units
+
+.. autofunction:: quantity_to_arr

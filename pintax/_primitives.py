@@ -26,9 +26,12 @@ from ._utils import (
 traceback_util.register_exclusion(__file__)
 
 
-def prim_make_unit(x: ArrayLike, unit: Unit) -> Array:
+def prim_mul_unit(x: ArrayLike, unit: Unit) -> Array:
+    """
+    multiply ``x`` by ``unit``
+    """
     assert isinstance(unit, Unit)
-    ans = make_unit_p.bind(check_arraylike(x), unit=unit)
+    ans = mul_unit_p.bind(check_arraylike(x), unit=unit)
     assert isinstance(ans, Array)
     return ans
 
@@ -47,36 +50,33 @@ def prim_convert_unit(value: ArrayLike, unit: ArrayLike) -> Array:
     return val
 
 
-make_unit_p = core.Primitive("make_unit")
+mul_unit_p = core.Primitive("make_unit")
 
 
-@make_unit_p.def_abstract_eval
+@mul_unit_p.def_abstract_eval
 def _(x: core.ShapedArray, /, *, unit: Unit):
     assert isinstance(unit, Unit)
     return x
 
 
-@rules_complex(make_unit_p)
+@rules_complex(mul_unit_p)
 def _(x: Qt, /, *, unit: Unit):
-    # assert x._unit in [dimensionless, anyunit]
-    # return quantity(x._val, unit)
-
     return quantity(x._val, mul_units(x._unit, unit))
 
 
-@dict_set(ad.primitive_jvps, make_unit_p)
+@dict_set(ad.primitive_jvps, mul_unit_p)
 def _(primals: tuple[ArrayLike], tangents: tuple[ArrayLike], /, *, unit: Unit):
-    ans = make_unit_p.bind(*primals, unit=unit)
+    ans = mul_unit_p.bind(*primals, unit=unit)
     (t,) = tangents
-    return ans, t / prim_make_unit(1, unit)
+    return ans, prim_mul_unit(t, unit)
 
 
-@make_unit_p.def_impl
+@mul_unit_p.def_impl
 def _(x: ArrayLike, /, *, unit: Unit):
     raise TypeError(f"trying to use {unit!r} outside of unitify")
 
 
-@partial(mlir.register_lowering, make_unit_p)
+@partial(mlir.register_lowering, mul_unit_p)
 @cast_unchecked[mlir.LoweringRule]()
 def _(ctx, x: ArrayLike, /, *, unit: Unit):
     raise TypeError(f"trying to use {unit!r} outside of unitify")

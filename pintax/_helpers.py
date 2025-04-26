@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Literal, overload
+from typing import Any, Callable, Literal, overload
 
 from jax import Array
+from jax import numpy as jnp
 from jax import tree_util as jtu
 from jax.typing import ArrayLike
 
-from ._api import Quantity, QuantityLike, Unit, ensure_arraylike
+from ._api import Quantity, QuantityLike, Unit, check_QuantityLike, ensure_arraylike
 from ._core import dimensionless
 from ._primitives import prim_convert_unit, prim_value_and_unit
-from ._utils import check_arraylike, ensure_jax
+from ._utils import check_arraylike, ensure_jax, tree_map
 
 
 def quantity(x: QuantityLike) -> Quantity:
@@ -39,6 +40,20 @@ def quantity(x: QuantityLike) -> Quantity:
     else:
         x = check_arraylike(x)
         return Quantity._create(x, Unit._concrete(dimensionless))
+
+
+@overload
+def tree_quantity(x: QuantityLike) -> Quantity: ...
+@overload
+def tree_quantity(x: tuple[QuantityLike, ...]) -> tuple[Quantity, ...]: ...
+@overload
+def tree_quantity(x: list[QuantityLike]) -> list[Quantity]: ...
+@overload
+def tree_quantity[T](x: T) -> T: ...
+
+
+def tree_quantity(x) -> Any:
+    return tree_map(x, quantity, is_leaf=check_QuantityLike)
 
 
 def value_and_unit(x: QuantityLike) -> tuple[ArrayLike, Unit]:
@@ -118,9 +133,18 @@ def sync_units(x) -> tuple[Any, Unit]:
       the first is a pytree with the same structure as x, with the resulting magnitudes.
       the second is the shared unit.
     """
-    args, pytree = jtu.tree_flatten(x)
+    args, pytree = jtu.tree_flatten(x, is_leaf=check_QuantityLike)
     assert len(args) > 0
     args_q = [quantity(x) for x in args]
     u = args_q[0].u
     out_bufs = [x.to(u).m for x in args_q]
     return jtu.tree_unflatten(pytree, out_bufs), u
+
+
+def _zeros_like(x: QuantityLike):
+    q = quantity(x)
+    return jnp.zeros_like(q.m) * q.u
+
+
+def zeros_like_same_unit[T](x: T) -> T:
+    return tree_map(_zeros_like, x)

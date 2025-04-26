@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, NamedTuple, Protocol, Sequence
+from typing import Callable, NamedTuple, Sequence
 
 from jax import Array, lax
 from jax import tree_util as jtu
-from jax._src import core, traceback_util
+from jax._src import core
 from jax._src.callback import io_callback_p, pure_callback_p
 from jax._src.core import Primitive
 from jax._src.custom_batching import custom_vmap_p
@@ -17,6 +17,7 @@ from ._core import (
     PintaxError_forward,
     Qt,
     Unit,
+    UnitTrace,
     UnitTracer,
     anyunit,
     dimensionless,
@@ -32,6 +33,7 @@ from ._utils import (
 )
 from ._utils import safe_zip as zip
 from ._utils import (
+    tree_map,
     weakref_lru_cache_,
 )
 
@@ -44,17 +46,20 @@ class wrapped_callback[R]:
     units: tuple[Unit, ...]
 
     def __call__(self, *args: ArrayLike) -> R:
-        with with_unit_trace() as trace:
+        @with_unit_trace
+        def inner(trace: UnitTrace):
             args_ = [
                 UnitTracer(trace, quantity(x, u)) for x, u in zip(args, self.units)
             ]
             ans = self.callback(*args_)
             try:
-                return jtu.tree_map(
+                return tree_map(
                     lambda x: trace.handle_primitive_arg(x)._to(dimensionless)._val, ans
                 )
             except PintaxError_forward as e:
                 raise e.unwrap() from None
+
+        return inner()
 
 
 @weakref_lru_cache_
@@ -134,6 +139,73 @@ def _(
         **kwargs,
     )
     return tuple(quantity(x, u) for x, u in zip(out_vals, out_units))
+
+
+def _tup_units(qs: tuple[Qt, ...]) -> tuple[Unit, ...]:
+    return tuple(x._unit for x in qs)
+
+
+def _tup_vals(qs: tuple[Qt, ...]) -> tuple[ArrayLike, ...]:
+    return tuple(x._val for x in qs)
+
+
+@rules_complex(lax.while_p)
+def _(
+    *args: Qt,
+    cond_jaxpr: core.ClosedJaxpr,
+    body_jaxpr: core.ClosedJaxpr,
+    body_nconsts: int,
+    cond_nconsts: int,
+):
+    assert len(cond_jaxpr.consts) == 0
+    assert len(body_jaxpr.consts) == 0
+
+    # cond_nconsts=len(cond_consts)
+    # body_nconsts=len(body_consts)
+    # args = (*cond_consts, *body_consts, *init_vals)
+
+    cond_consts = args[:cond_nconsts]
+    body_consts = args[cond_nconsts : cond_nconsts + body_nconsts]
+    init_vals = args[cond_nconsts + body_nconsts :]
+
+    def get_state_units() -> tuple[Unit, ...]:
+        state_units = _tup_units(init_vals)
+        for _ in range(1000):
+            _, new_units = unitify_jaxpr(
+                body_jaxpr.jaxpr,
+                _tup_units(body_consts) + state_units,
+            )
+            if not any(
+                x == anyunit and y != anyunit for x, y in zip(state_units, new_units)
+            ):
+                return new_units
+            state_units = new_units
+
+        raise RuntimeError("infinite loop")
+
+    state_units = get_state_units()
+
+    new_cond, _ = unitify_jaxpr(
+        cond_jaxpr.jaxpr,
+        _tup_units(cond_consts) + state_units,
+        force_out_units=(dimensionless,),
+    )
+    new_body, _ = unitify_jaxpr(
+        body_jaxpr.jaxpr,
+        _tup_units(body_consts) + state_units,
+        force_out_units=state_units,
+    )
+
+    out_vals: tuple[ArrayLike] = lax.while_p.bind(
+        *_tup_vals(cond_consts),
+        *_tup_vals(body_consts),
+        *[x._to(u)._val for x, u in zip(init_vals, state_units)],
+        cond_jaxpr=core.ClosedJaxpr(new_cond, cond_jaxpr.consts),
+        body_jaxpr=core.ClosedJaxpr(new_body, body_jaxpr.consts),
+        body_nconsts=body_nconsts,
+        cond_nconsts=cond_nconsts,
+    )
+    return tuple(quantity(x, u) for x, u in zip(out_vals, state_units))
 
 
 @rules_complex(lax.cond_p)
@@ -249,7 +321,7 @@ def _(
     a_outs = lax.linear_solve_p.bind(
         *(x._val for x in args),
         const_lengths=const_lengths,
-        jaxprs=LinearSolveTuple(*(core.ClosedJaxpr(x, []) for x in new_jaxprs)),
+        jaxprs=_LinearSolveTuple(*(core.ClosedJaxpr(x, []) for x in new_jaxprs)),
     )
 
     return tuple(quantity(x, u) for x, u in zip(a_outs, a_units))

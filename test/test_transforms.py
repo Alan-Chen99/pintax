@@ -1,12 +1,7 @@
-from typing import Any, Callable
-
 import jax
-from jax import Array
 from jax import numpy as jnp
-from jax.typing import ArrayLike
 
-import pintax
-from pintax import Quantity, areg, quantity, unitify, ureg
+from pintax import areg, quantity, unitify, ureg
 
 
 def f(x, y, z):
@@ -39,6 +34,9 @@ def test_jit():
     assert unitify(jnp.allclose, static_typed=False)(
         ans1, ans2, atol=1e-8 * ureg.kg * ureg.s
     )
+
+    comp = jax.jit(unitify(f)).lower(a, b, c).compile()
+    print("comp", comp(a, b, c))
 
 
 def f2(x, y, z):

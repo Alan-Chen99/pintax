@@ -7,10 +7,9 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
-    Concatenate,
     Literal,
-    Sequence,
     TypeGuard,
+    final,
     overload,
 )
 
@@ -20,10 +19,11 @@ import numpy as np
 import pint
 from jax import Array, lax
 from jax import numpy as jnp
+from jax import tree_util as jtu
 from jax._src import core, traceback_util
 from jax._src.numpy.util import promote_args
 from jax._src.traceback_util import api_boundary
-from jax._src.typing import DType, Shape, StaticScalar
+from jax._src.typing import DType, Shape
 from jax.typing import ArrayLike
 
 from ._core import (
@@ -31,16 +31,18 @@ from ._core import (
 )
 from ._core import Unit as CUnit_impl
 from ._core import (
+    UnitTrace,
     UnitTracer,
-    _global_ureg,
     anyunit,
     dimensionless,
     div_units,
+    global_ureg,
+    is_multiplicative,
     mul_units,
     pp_unit,
     with_unit_trace,
 )
-from ._primitives import prim_convert_unit, prim_make_unit, prim_value_and_unit
+from ._primitives import prim_convert_unit, prim_mul_unit, prim_value_and_unit
 from ._utils import (
     arraylike_to_float,
     cast_unchecked,
@@ -48,14 +50,48 @@ from ._utils import (
     check_unit,
     dtype_of,
     ensure_jax,
-    flattenctx,
     pp_obj,
     pretty_print,
+    shape_of,
+    tree_map,
     unreachable,
-    with_flatten,
 )
 
 traceback_util.register_exclusion(__file__)
+
+
+def check_QuantityLike(x: Any) -> TypeGuard[QuantityLike]:
+    return isinstance(x, QuantityLike)
+
+
+def ensure_arraylike(x: QuantityLike) -> ArrayLike:
+    if isinstance(x, Unit | Quantity):
+        return x.asarray()
+    return check_arraylike(x)
+
+
+@overload
+def quantity_to_arr(x: QuantityLike) -> Array: ...
+@overload
+def quantity_to_arr(x: tuple[QuantityLike, ...]) -> tuple[Array, ...]: ...
+@overload
+def quantity_to_arr(x: list[QuantityLike]) -> list[Array]: ...
+@overload
+def quantity_to_arr[T](x: T) -> T: ...
+
+
+def quantity_to_arr(x):
+    r"""
+    convert :class:`QuantityLike` or a tree of :class:`QuantityLike`
+    under :func:`unitify` into :class:`jax.Array`
+    """
+    return tree_map(_quantity_to_arr, x, is_leaf=check_QuantityLike)
+
+
+def _quantity_to_arr(x: QuantityLike) -> Array:
+    if isinstance(x, Unit | Quantity):
+        return x.asarray()
+    return prim_mul_unit(x, dimensionless)
 
 
 class _ConcreteUnit(eqx.Module):
@@ -67,7 +103,6 @@ class _ConcreteUnit(eqx.Module):
     def __pow__(self, i: int):
         if self._u is anyunit:
             return _ConcreteUnit(anyunit)
-        xx = self._u**i
         return _ConcreteUnit(check_unit(self._u**i))
 
 
@@ -100,11 +135,14 @@ def _quantity_binop(
             assert isinstance(ans, Array)
             return Quantity._from_arr(ans)
 
-        with with_unit_trace() as trace:
+        @with_unit_trace
+        def inner2(trace: UnitTrace, x1=x1, x2=x2):
             x1, x2 = (ensure_arraylike(x) for x in (x1, x2))
             x1, x2 = promote_args(str(fun), x1, x2)
             ans = fun(x1, x2)
             return Quantity._from_qt(trace.handle_primitive_arg(ans))
+
+        return inner2()
 
     return inner
 
@@ -245,34 +283,35 @@ def _quantity_comp_op(
             assert isinstance(ans, Array)
             return ans
 
-        with with_unit_trace() as trace:
+        @with_unit_trace
+        def inner2(trace: UnitTrace, x1=x1, x2=x2):
             x1, x2 = (ensure_arraylike(x) for x in (x1, x2))
             x1, x2 = promote_args(str(fun), x1, x2)
             ans = fun(x1, x2)
             ans_ = trace.handle_primitive_arg(ans)
             assert ans_._unit in [dimensionless, anyunit]
-            res = ans_._val
-        return jnp.array(res)
+            return ans_._val
+
+        return jnp.array(inner2())
 
     return inner
 
 
-def arraymethod_linear[**P](
-    method: Callable[[Array], Callable[P, Array]],
-) -> Callable[Concatenate[Quantity, P], Quantity]:
+def arraymethod_linear[**P](method: Callable[[Array], Callable[P, Array]]):
     @api_boundary
-    def inner(q: Quantity, *args: P.args, **kwargs: P.kwargs):
-        ans = method(ensure_jax(q.m))(*args, **kwargs)
-        return Quantity._create(ans, q.u)
+    def inner(self: Quantity, *args: P.args, **kwargs: P.kwargs) -> Quantity:
+        ans = method(ensure_jax(self.m))(*args, **kwargs)
+        return Quantity._create(ans, self.u)
 
     setattr(inner, "__signature__", inspect.signature(method(cast_unchecked()(Array))))
     return inner
 
 
+@final
 @dataclass
 class Unit:
     """
-    a unit. can be used inside and outside of unitify.
+    a unit. can be used inside and outside of :func:`unitify`.
     """
 
     _impl: _ConcreteUnit | _TracedUnit
@@ -299,17 +338,17 @@ class Unit:
 
     @property
     def dtype(self) -> DType:
-        return self.aval.dtype  # type: ignore
+        return dtype_of(self.aval)
 
     @property
     def shape(self) -> Shape:
-        return self.aval.shape  # type: ignore
+        return shape_of(self.aval)
 
     @api_boundary
     def asarray(self) -> Array:
         x = self._impl
         if isinstance(x, _ConcreteUnit):
-            return prim_make_unit(1, x._u)
+            return prim_mul_unit(1 if is_multiplicative(x._u) else jnp.nan, x._u)
         elif isinstance(x, _TracedUnit):
             return x._arr
         else:
@@ -319,7 +358,7 @@ class Unit:
     def a(self) -> Array:
         """
         Get an Array corresponding to 1 of this Unit.
-        can only be used under unitify.
+        can only be used under :func:`unitify`.
         """
         return self.asarray()
 
@@ -369,15 +408,17 @@ class Unit:
     def __pow__(self, i: int, /) -> Unit:
         return Unit(self._impl**i)
 
-    def __eq__(self, other: QuantityLike, /) -> Array:
+    def __eq__(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, other: QuantityLike, /
+    ) -> Array:
         return _quantity_comp_op(lax.eq)(self, other)
 
 
 class Quantity(eqx.Module):
     """
-    A Quantity type used to pass data between functions under unitify.
+    A Quantity type used to pass data between functions under :func:`unitify`.
 
-    It can also be used insdie unitify to obtain the value and unit of an array.
+    It can also be used insdie :func:`unitify` to obtain the value and unit of an array.
 
     Example:
 
@@ -429,6 +470,10 @@ class Quantity(eqx.Module):
     _disable_jvp_marker: ArrayLike = 1
 
     @property
+    def m_arr(self) -> Array:
+        return ensure_jax(self.m)
+
+    @property
     def u(self) -> Unit:
         """Unit"""
         return Unit(self._unit_impl)
@@ -436,6 +481,7 @@ class Quantity(eqx.Module):
     __array_priority__ = pint.Quantity.__array_priority__
 
     def __init__(self, *, _m: ArrayLike, _u: Unit):
+        super().__init__()
         self.m = _m
         self._unit_impl = _u._impl
 
@@ -458,7 +504,7 @@ class Quantity(eqx.Module):
 
     @property
     def shape(self) -> Shape:
-        return self.aval.shape  # type: ignore
+        return shape_of(self.aval)
 
     @property
     def size(self) -> int:
@@ -495,7 +541,7 @@ class Quantity(eqx.Module):
     @api_boundary
     def asarray(self) -> Array:
         if isinstance(self.u._impl, _ConcreteUnit):
-            return prim_make_unit(self.m, self.u._impl._u)
+            return prim_mul_unit(self.m, self.u._impl._u)
 
         u_arr = lax.convert_element_type(self.u.asarray(), new_dtype=dtype_of(self.m))
         ans = self.m * u_arr
@@ -505,7 +551,7 @@ class Quantity(eqx.Module):
     @property
     def a(self) -> Array:
         """
-        converts Quantity into a Array under unitify
+        converts Quantity into a Array under :func:`unitify`
         """
         return self.asarray()
 
@@ -515,7 +561,8 @@ class Quantity(eqx.Module):
             # fake assert, will not pass at runtime
             assert isinstance(self, Array)
             return self
-        return self
+        else:
+            return self
 
     # lax does not jit and gives better unit errors
     __add__ = _quantity_binop(lax.add)
@@ -538,7 +585,9 @@ class Quantity(eqx.Module):
     def __pow__(self, i: int, /):
         return Quantity._create(self.m**i, self.u**i)
 
-    def __eq__(self, other: QuantityLike, /) -> Array:
+    def __eq__(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, other: QuantityLike, /
+    ) -> Array:
         return _quantity_comp_op(lax.eq)(self, other)
 
     def to(self, new_unit: Unit, /) -> Quantity:
@@ -548,11 +597,14 @@ class Quantity(eqx.Module):
             ans = prim_convert_unit(self.asarray(), new_unit.asarray())
             return Quantity._from_arr(ans)
 
-        with with_unit_trace() as trace:
+        @with_unit_trace
+        def inner2(trace: UnitTrace):
             x1 = ensure_arraylike(self)
             x2 = ensure_arraylike(new_unit)
             ans = prim_convert_unit(x1, x2)
             return Quantity._from_qt(trace.handle_primitive_arg(ans))
+
+        return inner2()
 
     def _m_dimensionless(self) -> ArrayLike:
         return self.to(Unit._concrete(dimensionless)).m
@@ -583,8 +635,6 @@ class Quantity(eqx.Module):
 
 
 QuantityLike = Unit | Quantity | ArrayLike
-ArrayLikeNonArr = np.ndarray | StaticScalar
-QuantityLikeNonArr = Unit | Quantity | ArrayLikeNonArr
 
 
 def _is_traced(x: QuantityLike) -> bool:
@@ -593,16 +643,6 @@ def _is_traced(x: QuantityLike) -> bool:
         or (isinstance(x, Unit) and isinstance(x._impl, _TracedUnit))
         or (isinstance(x, Quantity) and isinstance(x.u._impl, _TracedUnit))
     )
-
-
-def ensure_arraylike(x: QuantityLike) -> ArrayLike:
-    if isinstance(x, Unit | Quantity):
-        return x.asarray()
-    return check_arraylike(x)
-
-
-def _check_QuantityLike(x: Any) -> TypeGuard[QuantityLike]:
-    return isinstance(x, QuantityLike)
 
 
 @overload
@@ -675,7 +715,7 @@ def unitify(
     wrap_inputs=True,
 ) -> Callable:
     """
-    To use units in a function, it must be wrapped with ``unitify``.
+    To use units in a function, it must be wrapped with :func:`unitify`.
 
     Args:
         fun: function to unitify.
@@ -704,41 +744,41 @@ def unitify(
     first 3 overloads extend to pytrees;
     last overload infer a generic type that might not be correct.
     """
+    del static_typed
     if force_dimensionless_outs and unwrap_outs:
         raise TypeError()
 
-    def _unitify_flat(
-        ctx: flattenctx[QuantityLike], bufs: Sequence[QuantityLike]
-    ) -> Sequence[QuantityLike]:
-        with with_unit_trace() as trace:
-            for x in bufs:
-                if not isinstance(x, Array):
-                    assert not _is_traced(x)
-            bufs_q = [
-                UnitTracer(trace, trace.handle_primitive_arg(ensure_arraylike(x)))
-                for x in bufs
-            ]
-            out_bufs = ctx.call(bufs_q)
-            out_bufs_q = [
-                trace.handle_primitive_arg(ensure_arraylike(x)) for x in out_bufs
-            ]
-            if unwrap_outs:
-                return [
-                    (
-                        x._val
-                        if x._unit in [dimensionless, anyunit]
-                        else Quantity._from_qt(x)
-                    )
-                    for x in out_bufs_q
-                ]
-            elif force_dimensionless_outs:
-                for x in out_bufs_q:
-                    assert x._unit in [dimensionless, anyunit]
-                return [x._val for x in out_bufs_q]
-            else:
-                return [Quantity._from_qt(x) for x in out_bufs_q]
+    @functools.wraps(fun)
+    @api_boundary
+    @with_unit_trace
+    def inner(trace: UnitTrace, *args, **kwargs):
+        if wrap_inputs:
+            args, kwargs = quantity_to_arr((args, kwargs))
+        ans = fun(*args, **kwargs)
 
-    return with_flatten(fun, _unitify_flat, _check_QuantityLike)
+        def handle_output(x_: QuantityLike):
+            x = trace.handle_primitive_arg(ensure_arraylike(x_))
+
+            if unwrap_outs:
+                if x._unit in [dimensionless, anyunit]:
+                    return x._val
+                else:
+                    return Quantity._from_qt(x)
+
+            elif force_dimensionless_outs:
+                assert x._unit in [dimensionless, anyunit]
+                return x._val
+
+            else:
+                return Quantity._from_qt(x)
+
+        return tree_map(handle_output, ans, is_leaf=check_QuantityLike)
+
+    try:
+        setattr(inner, "__signature__", inspect.signature(fun))
+    except:
+        pass
+    return inner
 
 
 class _ureg_t:
@@ -748,7 +788,7 @@ class _ureg_t:
 
     @api_boundary
     def __call__(self, name: str) -> Unit:
-        ans = check_unit(_global_ureg(name).units)
+        ans = check_unit(global_ureg(name).units)
         return Unit._concrete(ans)
 
     def __repr__(self):
@@ -771,6 +811,10 @@ class _areg_t:
         """
         return _areg_t.__call__(name)
 
+    @property
+    def dimensionless(self) -> Array:
+        return self("dimensionless")
+
     @staticmethod
     @api_boundary
     def __call__(name: str, /) -> Array:
@@ -783,8 +827,8 @@ class _areg_t:
         >>> unitify(lambda: areg("m"))()
         Quantity(1, 'meter')
         """
-        ans = check_unit(_global_ureg(name).units)
-        return prim_make_unit(1, ans)
+        ans = check_unit(global_ureg(name).units)
+        return prim_mul_unit(1 if is_multiplicative(ans) else jnp.nan, ans)
 
     def __repr__(self):
         return f"<{self.__module__}.areg>"
